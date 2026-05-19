@@ -5,6 +5,9 @@ from typing import Any
 
 import httpx
 
+from src.github.models import PRContext
+from src.github.queries import OPEN_PRS_WITH_CONTEXT
+
 logger = logging.getLogger(__name__)
 
 GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
@@ -13,15 +16,10 @@ DEFAULT_TIMEOUT_S = 30.0
 MAX_SERVER_ERROR_RETRIES = 3
 BASE_BACKOFF_S = 1.0
 RATE_LIMIT_WAIT_CAP_S = 60.0
+GITHUB_MAX_PAGE_SIZE = 100
 
 
 class GitHubAPIError(Exception):
-    """Raised when the GitHub GraphQL API returns an unrecoverable error.
-
-    Carries the HTTP status code and response body so callers can debug
-    auth failures, malformed queries, and unexpected payloads.
-    """
-
     def __init__(
         self,
         message: str,
@@ -35,8 +33,6 @@ class GitHubAPIError(Exception):
 
 
 class GitHubClient:
-    """Async client wrapping httpx for the GitHub GraphQL API."""
-
     def __init__(
         self,
         token: str,
@@ -50,13 +46,6 @@ class GitHubClient:
         self._client = client or httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S)
 
     async def query(self, gql_query: str, variables: dict[str, Any]) -> dict[str, Any]:
-        """Execute a GraphQL query and return the parsed response payload.
-
-        Handles HTTP 429 / GraphQL RATE_LIMITED by sleeping until the reset
-        timestamp (capped) and retrying once. Retries 5xx with exponential
-        backoff up to MAX_SERVER_ERROR_RETRIES. All other failures raise
-        GitHubAPIError with the response body attached.
-        """
         payload = {"query": gql_query, "variables": variables}
         headers = {
             "Authorization": f"bearer {self._token}",
@@ -78,7 +67,11 @@ class GitHubClient:
                     delay = BASE_BACKOFF_S * (2**server_error_attempts)
                     logger.warning(
                         "github_transport_retry",
-                        extra={"attempt": server_error_attempts + 1, "delay_s": delay, "error": str(exc)},
+                        extra={
+                            "attempt": server_error_attempts + 1,
+                            "delay_s": delay,
+                            "error": str(exc),
+                        },
                     )
                     await asyncio.sleep(delay)
                     server_error_attempts += 1
@@ -153,8 +146,49 @@ class GitHubClient:
 
             return data
 
+    async def fetch_open_prs(
+        self,
+        owner: str,
+        name: str,
+        limit: int = 50,
+    ) -> list[PRContext]:
+        if limit <= 0:
+            return []
+
+        collected: list[PRContext] = []
+        cursor: str | None = None
+
+        while len(collected) < limit:
+            page_size = min(GITHUB_MAX_PAGE_SIZE, limit - len(collected))
+            variables: dict[str, Any] = {
+                "owner": owner,
+                "name": name,
+                "first": page_size,
+                "after": cursor,
+            }
+            response = await self.query(OPEN_PRS_WITH_CONTEXT, variables)
+
+            repository = (response.get("data") or {}).get("repository")
+            if not repository:
+                raise GitHubAPIError(
+                    f"Repository {owner}/{name} not found or not accessible",
+                    body=str(response),
+                )
+
+            pulls = repository.get("pullRequests") or {}
+            for node in pulls.get("nodes") or []:
+                collected.append(PRContext.model_validate(node))
+
+            page_info = pulls.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                break
+
+        return collected[:limit]
+
     async def aclose(self) -> None:
-        """Close the underlying HTTP client if owned by this instance."""
         if self._owns_client:
             await self._client.aclose()
 
