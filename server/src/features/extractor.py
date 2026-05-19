@@ -5,7 +5,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from src.github.models import AuthorProfile, FileChange, PRContext
 
-__all__ = ["PRFeatures", "extract"]
+__all__ = [
+    "PRFeatures",
+    "compute_dependency_depths",
+    "detect_cross_pr_references",
+    "extract",
+]
 
 DEFAULT_CRITICAL_PATTERNS = [
     r"kubelet/pleg",
@@ -46,6 +51,8 @@ KIND_TOKENS = {
     "cleanup",
 }
 
+_PR_REF = re.compile(r"#(\d+)")
+
 
 class PRFeatures(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -75,6 +82,53 @@ class PRFeatures(BaseModel):
     pr_age_days: float
     days_since_last_activity: float
 
+    mentioned_by_other_open_prs: int = 0
+    dependency_chain_depth: int = 0
+
+
+def detect_cross_pr_references(all_prs: list[PRContext]) -> dict[int, list[int]]:
+    open_numbers = {pr.number for pr in all_prs}
+    references: dict[int, list[int]] = {pr.number: [] for pr in all_prs}
+    for source in all_prs:
+        text = f"{source.title}\n{source.body or ''}"
+        seen: set[int] = set()
+        for match in _PR_REF.findall(text):
+            num = int(match)
+            if num == source.number or num not in open_numbers or num in seen:
+                continue
+            seen.add(num)
+            references[num].append(source.number)
+    return references
+
+
+def compute_dependency_depths(references: dict[int, list[int]]) -> dict[int, int]:
+    depths: dict[int, int] = {}
+
+    def visit(pr_num: int, in_progress: set[int]) -> int:
+        if pr_num in depths:
+            return depths[pr_num]
+        mentioned_by = references.get(pr_num, [])
+        if not mentioned_by:
+            depths[pr_num] = 0
+            return 0
+        in_progress.add(pr_num)
+        best = 0
+        cycle_seen = False
+        for upstream in mentioned_by:
+            if upstream in in_progress:
+                cycle_seen = True
+                continue
+            best = max(best, visit(upstream, in_progress) + 1)
+        in_progress.discard(pr_num)
+        if cycle_seen and best == 0:
+            best = 1
+        depths[pr_num] = best
+        return best
+
+    for pr_num in list(references.keys()):
+        visit(pr_num, set())
+    return depths
+
 
 def extract(
     pr: PRContext,
@@ -82,6 +136,8 @@ def extract(
     files: list[FileChange],
     *,
     critical_patterns: list[str] | None = None,
+    cross_pr_references: dict[int, list[int]] | None = None,
+    cross_pr_depths: dict[int, int] | None = None,
     now: datetime | None = None,
 ) -> PRFeatures:
     patterns = critical_patterns if critical_patterns is not None else DEFAULT_CRITICAL_PATTERNS
@@ -89,6 +145,13 @@ def extract(
 
     paths = [fc.path for fc in files]
     label_names = [lbl.name for lbl in pr.labels]
+
+    mentioned_count = (
+        len(cross_pr_references.get(pr.number, [])) if cross_pr_references is not None else 0
+    )
+    chain_depth = (
+        cross_pr_depths.get(pr.number, 0) if cross_pr_depths is not None else 0
+    )
 
     return PRFeatures(
         pr_number=pr.number,
@@ -111,6 +174,8 @@ def extract(
         author_avg_review_comments=author.avg_review_comments_per_pr,
         pr_age_days=_days_between(pr.created_at, now_ts),
         days_since_last_activity=_days_between(pr.updated_at, now_ts),
+        mentioned_by_other_open_prs=mentioned_count,
+        dependency_chain_depth=chain_depth,
     )
 
 

@@ -1,6 +1,10 @@
 from datetime import datetime, timezone
 
-from src.features.extractor import extract
+from src.features.extractor import (
+    compute_dependency_depths,
+    detect_cross_pr_references,
+    extract,
+)
 from src.github.models import AuthorProfile, FileChange, PRContext
 
 NOW = datetime(2026, 5, 19, tzinfo=timezone.utc)
@@ -132,3 +136,90 @@ def test_age_and_activity_days_match_created_and_updated() -> None:
     features = _extract(["main.go"])
     assert abs(features.pr_age_days - 18.0) < 0.5
     assert abs(features.days_since_last_activity - 9.0) < 0.5
+
+
+def _mk_pr(number: int, *, body: str = "", title: str = "t") -> PRContext:
+    return PRContext.model_validate(
+        {
+            "number": number,
+            "title": title,
+            "body": body,
+            "url": f"https://github.com/o/r/pull/{number}",
+            "createdAt": "2026-05-01T00:00:00Z",
+            "updatedAt": "2026-05-10T00:00:00Z",
+            "author": {"login": "x"},
+            "headRefName": "main",
+            "mergeable": "MERGEABLE",
+            "additions": 1,
+            "deletions": 0,
+            "changedFiles": 1,
+            "labels": {"nodes": []},
+            "closingIssuesReferences": {"nodes": []},
+        }
+    )
+
+
+def test_detect_cross_pr_references_basic() -> None:
+    prs = [_mk_pr(1, body="this depends on #2"), _mk_pr(2, body="standalone")]
+    refs = detect_cross_pr_references(prs)
+    assert refs[2] == [1]
+    assert refs[1] == []
+
+
+def test_detect_cross_pr_references_matches_title_and_body() -> None:
+    prs = [_mk_pr(1, title="follows #2"), _mk_pr(2, body="see also #3"), _mk_pr(3)]
+    refs = detect_cross_pr_references(prs)
+    assert refs[2] == [1]
+    assert refs[3] == [2]
+
+
+def test_detect_cross_pr_references_excludes_self_and_unknown() -> None:
+    prs = [_mk_pr(5, body="closes #5 and refs #999")]
+    refs = detect_cross_pr_references(prs)
+    assert refs[5] == []
+
+
+def test_detect_cross_pr_references_deduplicates_same_source() -> None:
+    prs = [_mk_pr(1, body="fixes #2 and reverts #2"), _mk_pr(2)]
+    refs = detect_cross_pr_references(prs)
+    assert refs[2] == [1]
+
+
+def test_compute_dependency_depths_linear_chain() -> None:
+    prs = [_mk_pr(1), _mk_pr(2, body="depends on #1"), _mk_pr(3, body="depends on #2")]
+    depths = compute_dependency_depths(detect_cross_pr_references(prs))
+    assert depths[3] == 0
+    assert depths[2] == 1
+    assert depths[1] == 2
+
+
+def test_compute_dependency_depths_no_dependencies() -> None:
+    prs = [_mk_pr(1), _mk_pr(2), _mk_pr(3)]
+    depths = compute_dependency_depths(detect_cross_pr_references(prs))
+    assert depths == {1: 0, 2: 0, 3: 0}
+
+
+def test_compute_dependency_depths_breaks_cycles() -> None:
+    prs = [_mk_pr(1, body="ref #2"), _mk_pr(2, body="ref #1")]
+    depths = compute_dependency_depths(detect_cross_pr_references(prs))
+    assert depths[1] >= 1
+    assert depths[2] >= 1
+
+
+def test_extract_populates_dependency_fields_when_graph_passed() -> None:
+    features = extract(
+        _pr(),
+        _profile(),
+        _files(["main.go"]),
+        cross_pr_references={1: [99, 100, 101]},
+        cross_pr_depths={1: 2},
+        now=NOW,
+    )
+    assert features.mentioned_by_other_open_prs == 3
+    assert features.dependency_chain_depth == 2
+
+
+def test_extract_dependency_fields_default_to_zero_without_graph() -> None:
+    features = extract(_pr(), _profile(), _files(["main.go"]), now=NOW)
+    assert features.mentioned_by_other_open_prs == 0
+    assert features.dependency_chain_depth == 0
