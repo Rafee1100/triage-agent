@@ -1,6 +1,6 @@
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.agents.base import BaseAgent
+from src.agents.base import SONNET_MODEL, BaseAgent
 from src.agents.synthesizer import Ranking
 
 __all__ = ["CriticAgent", "RankAdjustment", "RankingCritique"]
@@ -8,23 +8,19 @@ __all__ = ["CriticAgent", "RankAdjustment", "RankingCritique"]
 MAX_ADJUSTMENTS = 3
 
 SYSTEM_PROMPT = """\
-You are critic in TriagePilot. You receive a ranking produced by the synthesizer and review it for errors.
+critic — review the synthesizer ranking for errors.
 
-Catch these specifically:
-1. PRs with high blast_radius_score (>=0.7) ranked below PRs with low blast_radius (<0.3).
-2. PRs that block other PRs (dependency_chain_depth >= 2 or mentioned_by_other_open_prs >= 2) ranked too low.
-3. PRs flagged with label_disagreement=True whose reasoning doesn't actually justify the disagreement.
+Catch:
+1. High blast_radius (>=0.7) ranked behind low blast (<0.3).
+2. Dep-blockers (depth>=2 or mentioned_by>=2) ranked too low.
+3. label_disagreement=True with reasoning that doesn't justify it.
 
-Output:
-- adjustments: 0 to 3 swaps. Each is {pr_number, new_rank, reason}. Empty list means "ranking is sound".
-- overall_assessment: 1-2 sentences on the ranking's overall quality.
+adjustments: 0-3 swaps. Each {pr_number, new_rank, reason}. Empty list = sound.
+overall_assessment: 1-2 sentences.
 
-Constraints:
-- Each adjustment.reason MUST cite a specific signal value (e.g. "blast_radius=0.85, currently ranked #12").
-- new_rank must be within [1, N] where N is the total PR count.
-- The synthesizer is usually right; only intervene for clear errors. Do not propose more than 3 adjustments.
+Each reason MUST cite a specific signal value. Synthesizer is usually right.
 
-Output strictly via the critic_output tool."""
+Output via tool only."""
 
 
 class RankAdjustment(BaseModel):
@@ -44,18 +40,17 @@ class RankingCritique(BaseModel):
 
 class CriticAgent(BaseAgent[RankingCritique]):
     name = "critic"
-    model = "claude-sonnet-4-5-20251022"
+    model = SONNET_MODEL
     output_schema = RankingCritique
     system_prompt = SYSTEM_PROMPT
 
     @staticmethod
     def format_message(ranking: Ranking) -> str:
-        parts = [f"Synthesizer's ranking (N={len(ranking.prs)}):", ""]
+        parts = [f"N={len(ranking.prs)}"]
         for pr in sorted(ranking.prs, key=lambda p: p.rank):
             parts.append(
-                f"  #{pr.rank}: PR #{pr.pr_number}  [{pr.ai_priority}]  "
-                f"disagreement={pr.label_disagreement}\n"
-                f"     reasoning: {pr.reasoning}"
+                f"#{pr.rank}: PR{pr.pr_number} [{pr.ai_priority}] td={pr.label_disagreement}"
+                f" — {pr.reasoning[:120]}"
             )
         return "\n".join(parts)
 

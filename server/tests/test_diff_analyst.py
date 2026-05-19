@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -29,23 +30,32 @@ def _pr(*, title: str = "Sample", linked: list[dict] | None = None) -> PRContext
     )
 
 
-def _fake_client_returning(*responses: Any) -> SimpleNamespace:
+def _fake_completion(*responses: Any) -> Any:
     iterator = iter(responses)
 
-    async def create(**_kwargs: Any) -> Any:
+    async def completion(**_kwargs: Any) -> Any:
         return next(iterator)
 
-    return SimpleNamespace(messages=SimpleNamespace(create=create))
+    return completion
 
 
-def _tool_response(input_payload: dict[str, Any]) -> SimpleNamespace:
+def _tool_response(payload: dict[str, Any]) -> SimpleNamespace:
     return SimpleNamespace(
-        content=[
+        choices=[
             SimpleNamespace(
-                type="tool_use", name="diff_analyst_output", input=input_payload
-            ),
+                message=SimpleNamespace(
+                    tool_calls=[
+                        SimpleNamespace(
+                            function=SimpleNamespace(
+                                name="diff_analyst_output",
+                                arguments=json.dumps(payload),
+                            )
+                        )
+                    ]
+                )
+            )
         ],
-        usage=SimpleNamespace(input_tokens=300, output_tokens=80),
+        usage=SimpleNamespace(prompt_tokens=300, completion_tokens=80),
     )
 
 
@@ -56,10 +66,10 @@ def test_format_message_renders_title_totals_and_files() -> None:
         FileChange(path="pkg/auth/middleware_test.go", additions=10, deletions=0),
     ]
     msg = DiffAnalystAgent.format_message(pr, files)
-    assert "PR title: Fix auth bug" in msg
+    assert "title: Fix auth bug" in msg
     assert "pkg/auth/middleware.go" in msg
     assert "+20/-5" in msg
-    assert "Totals: +30 / -5, 2 files changed" in msg
+    assert "totals: +30/-5, 2f" in msg
 
 
 def test_format_message_includes_linked_issue_summary() -> None:
@@ -81,10 +91,10 @@ def test_format_message_includes_linked_issue_summary() -> None:
 
 def test_format_message_truncates_large_file_lists() -> None:
     pr = _pr()
-    files = [FileChange(path=f"f{i}.go", additions=1, deletions=0) for i in range(60)]
+    files = [FileChange(path=f"f{i}.go", additions=1, deletions=0) for i in range(25)]
     msg = DiffAnalystAgent.format_message(pr, files)
     assert "and 10 more files" in msg
-    assert "f50.go" not in msg
+    assert "f20.go" not in msg
 
 
 async def test_agent_returns_validated_diff_analysis() -> None:
@@ -96,9 +106,8 @@ async def test_agent_returns_validated_diff_analysis() -> None:
             "reasoning": "Touches auth middleware with goroutine usage.",
         }
     )
-    agent = DiffAnalystAgent(_fake_client_returning(response))  # type: ignore[arg-type]
+    agent = DiffAnalystAgent(completion=_fake_completion(response))
     result = await agent.run("test")
-
     assert result.effort_minutes_estimate == 45
     assert result.blast_radius_score == 0.7
     assert result.risk_tags == ["auth", "concurrency"]
@@ -113,7 +122,7 @@ async def test_agent_rejects_effort_out_of_bounds() -> None:
             "reasoning": "x",
         }
     )
-    agent = DiffAnalystAgent(_fake_client_returning(bad, bad))  # type: ignore[arg-type]
+    agent = DiffAnalystAgent(completion=_fake_completion(bad, bad))
     with pytest.raises(AgentError):
         await agent.run("test")
 
@@ -127,7 +136,7 @@ async def test_agent_rejects_unknown_risk_tag() -> None:
             "reasoning": "x",
         }
     )
-    agent = DiffAnalystAgent(_fake_client_returning(bad, bad))  # type: ignore[arg-type]
+    agent = DiffAnalystAgent(completion=_fake_completion(bad, bad))
     with pytest.raises(AgentError):
         await agent.run("test")
 
@@ -141,6 +150,6 @@ async def test_agent_rejects_blast_radius_above_one() -> None:
             "reasoning": "x",
         }
     )
-    agent = DiffAnalystAgent(_fake_client_returning(bad, bad))  # type: ignore[arg-type]
+    agent = DiffAnalystAgent(completion=_fake_completion(bad, bad))
     with pytest.raises(AgentError):
         await agent.run("test")

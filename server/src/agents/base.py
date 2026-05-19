@@ -1,31 +1,33 @@
 import asyncio
 import json
 import logging
-import re
+import os
 import time
-from typing import Any, Generic, TypeVar
+from typing import Any, Awaitable, Callable, Generic, TypeVar
 
-import anthropic
-from anthropic import AsyncAnthropic
+os.environ.setdefault("LITELLM_LOG", "ERROR")
+
+import litellm
 from pydantic import BaseModel, ValidationError
+
+litellm.suppress_debug_info = True
+litellm.set_verbose = False
 
 T = TypeVar("T", bound=BaseModel)
 
 logger = logging.getLogger(__name__)
 
-MAX_TOKENS = 4096
-ANTHROPIC_RETRY_ATTEMPTS = 3
-BASE_BACKOFF_S = 1.0
+HAIKU_MODEL = os.getenv("HAIKU_MODEL", "groq/llama-3.3-70b-versatile")
+SONNET_MODEL = os.getenv("SONNET_MODEL", "groq/llama-3.3-70b-versatile")
 
-PRICING_PER_M = {
-    "claude-sonnet-4-5": {"input": 3.0, "output": 15.0},
-    "claude-haiku-4-5": {"input": 0.80, "output": 4.0},
-}
+MAX_TOKENS = 1024
+RETRY_ATTEMPTS = 6
+BASE_BACKOFF_S = 2.0
+MAX_BACKOFF_S = 60.0
 
-RETRY_REMINDER = (
-    "IMPORTANT: Return ONLY valid JSON matching the tool's input_schema. "
-    "No prose, no markdown, no commentary."
-)
+RETRY_REMINDER = "Return ONLY valid JSON for the tool. No prose."
+
+CompletionFn = Callable[..., Awaitable[Any]]
 
 
 class AgentError(Exception):
@@ -38,8 +40,8 @@ class BaseAgent(Generic[T]):
     output_schema: type[T]
     system_prompt: str = ""
 
-    def __init__(self, client: AsyncAnthropic) -> None:
-        self.client = client
+    def __init__(self, completion: CompletionFn | None = None) -> None:
+        self._completion = completion or litellm.acompletion
 
     async def run(self, user_message: str) -> T:
         tool_schema = self._build_tool_schema()
@@ -63,22 +65,29 @@ class BaseAgent(Generic[T]):
         is_retry: bool,
     ) -> tuple[T | None, str | None]:
         t0 = time.perf_counter()
-        response = await self._messages_create_with_retries(user_message, tool_schema)
+        try:
+            response = await self._completion_with_retries(user_message, tool_schema)
+        except litellm.BadRequestError as exc:
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            _emit_log(
+                {
+                    "event": "agent_call",
+                    "agent": self.name,
+                    "model": self.model,
+                    "duration_ms": duration_ms,
+                    "tokens_in": 0,
+                    "tokens_out": 0,
+                    "cost_usd": 0.0,
+                    "retry": is_retry,
+                    "error": "bad_request",
+                }
+            )
+            return None, f"bad_request: {exc}"
         duration_ms = int((time.perf_counter() - t0) * 1000)
 
-        tool_use_input: dict[str, Any] | None = None
-        for block in response.content:
-            if (
-                getattr(block, "type", None) == "tool_use"
-                and getattr(block, "name", None) == self._tool_name()
-            ):
-                tool_use_input = getattr(block, "input", None)
-                break
-
-        usage = getattr(response, "usage", None)
-        tokens_in = int(getattr(usage, "input_tokens", 0) or 0)
-        tokens_out = int(getattr(usage, "output_tokens", 0) or 0)
-        cost = _estimate_cost(self.model, tokens_in, tokens_out)
+        tool_input = self._extract_tool_input(response)
+        tokens_in, tokens_out = self._extract_usage(response)
+        cost = self._estimate_cost(response)
 
         _emit_log(
             {
@@ -93,15 +102,15 @@ class BaseAgent(Generic[T]):
             }
         )
 
-        if tool_use_input is None:
-            return None, "no tool_use block in response"
+        if tool_input is None:
+            return None, "no tool_call in response"
 
         try:
-            return self.output_schema.model_validate(tool_use_input), None
+            return self.output_schema.model_validate(tool_input), None
         except ValidationError as exc:
             return None, str(exc)
 
-    async def _messages_create_with_retries(
+    async def _completion_with_retries(
         self,
         user_message: str,
         tool_schema: dict[str, Any],
@@ -109,21 +118,26 @@ class BaseAgent(Generic[T]):
         attempts = 0
         while True:
             try:
-                return await self.client.messages.create(
+                return await self._completion(
                     model=self.model,
                     max_tokens=MAX_TOKENS,
-                    system=self.system_prompt,
-                    messages=[{"role": "user", "content": user_message}],
-                    tools=[tool_schema],
-                    tool_choice={"type": "tool", "name": self._tool_name()},
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": user_message},
+                    ],
+                    tools=[{"type": "function", "function": tool_schema}],
+                    tool_choice={
+                        "type": "function",
+                        "function": {"name": self._tool_name()},
+                    },
                 )
-            except (anthropic.RateLimitError, anthropic.APIConnectionError) as exc:
+            except (litellm.RateLimitError, litellm.APIConnectionError) as exc:
                 attempts += 1
-                if attempts >= ANTHROPIC_RETRY_ATTEMPTS:
+                if attempts >= RETRY_ATTEMPTS:
                     raise
-                delay = BASE_BACKOFF_S * (2 ** (attempts - 1))
+                delay = min(BASE_BACKOFF_S * (2 ** (attempts - 1)), MAX_BACKOFF_S)
                 logger.warning(
-                    "anthropic_retry",
+                    "llm_retry",
                     extra={
                         "agent": self.name,
                         "attempt": attempts,
@@ -139,17 +153,54 @@ class BaseAgent(Generic[T]):
     def _build_tool_schema(self) -> dict[str, Any]:
         return {
             "name": self._tool_name(),
-            "description": f"Structured output for the {self.name} agent.",
-            "input_schema": self.output_schema.model_json_schema(),
+            "description": f"{self.name} output",
+            "parameters": _compact_schema(self.output_schema.model_json_schema()),
         }
 
+    def _extract_tool_input(self, response: Any) -> dict[str, Any] | None:
+        try:
+            choices = getattr(response, "choices", None) or []
+            if not choices:
+                return None
+            message = getattr(choices[0], "message", None)
+            tool_calls = getattr(message, "tool_calls", None) or []
+            for call in tool_calls:
+                fn = getattr(call, "function", None)
+                if fn is None:
+                    continue
+                if getattr(fn, "name", None) != self._tool_name():
+                    continue
+                args = getattr(fn, "arguments", None)
+                if isinstance(args, str):
+                    return json.loads(args)
+                if isinstance(args, dict):
+                    return args
+            return None
+        except (json.JSONDecodeError, AttributeError):
+            return None
 
-def _estimate_cost(model: str, tokens_in: int, tokens_out: int) -> float:
-    base = re.sub(r"-\d{8}$", "", model)
-    rates = PRICING_PER_M.get(base)
-    if not rates:
-        return 0.0
-    return (tokens_in * rates["input"] + tokens_out * rates["output"]) / 1_000_000
+    @staticmethod
+    def _extract_usage(response: Any) -> tuple[int, int]:
+        usage = getattr(response, "usage", None)
+        return (
+            int(getattr(usage, "prompt_tokens", 0) or 0),
+            int(getattr(usage, "completion_tokens", 0) or 0),
+        )
+
+    @staticmethod
+    def _estimate_cost(response: Any) -> float:
+        try:
+            return float(litellm.completion_cost(completion_response=response) or 0.0)
+        except Exception:
+            return 0.0
+
+
+def _compact_schema(node: Any) -> Any:
+    if isinstance(node, dict):
+        return {k: _compact_schema(v) for k, v in node.items() if k != "title"}
+    if isinstance(node, list):
+        return [_compact_schema(v) for v in node]
+    return node
 
 
 def _emit_log(payload: dict[str, Any]) -> None:

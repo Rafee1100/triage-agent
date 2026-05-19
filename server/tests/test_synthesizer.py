@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -7,23 +8,32 @@ from src.agents.base import AgentError
 from src.agents.synthesizer import Ranking, SynthesizerAgent
 
 
-def _fake_client(*responses: Any) -> SimpleNamespace:
+def _fake_completion(*responses: Any) -> Any:
     iterator = iter(responses)
 
-    async def create(**_kwargs: Any) -> Any:
+    async def completion(**_kwargs: Any) -> Any:
         return next(iterator)
 
-    return SimpleNamespace(messages=SimpleNamespace(create=create))
+    return completion
 
 
 def _tool_response(payload: dict[str, Any]) -> SimpleNamespace:
     return SimpleNamespace(
-        content=[
+        choices=[
             SimpleNamespace(
-                type="tool_use", name="synthesizer_output", input=payload
+                message=SimpleNamespace(
+                    tool_calls=[
+                        SimpleNamespace(
+                            function=SimpleNamespace(
+                                name="synthesizer_output",
+                                arguments=json.dumps(payload),
+                            )
+                        )
+                    ]
+                )
             )
         ],
-        usage=SimpleNamespace(input_tokens=2000, output_tokens=400),
+        usage=SimpleNamespace(prompt_tokens=2000, completion_tokens=400),
     )
 
 
@@ -48,7 +58,7 @@ async def test_synthesizer_returns_valid_ranking() -> None:
             ]
         }
     )
-    agent = SynthesizerAgent(_fake_client(response))  # type: ignore[arg-type]
+    agent = SynthesizerAgent(completion=_fake_completion(response))
     ranking: Ranking = await agent.run("input batch")
     assert len(ranking.prs) == 2
     assert ranking.prs[0].rank == 1
@@ -69,6 +79,6 @@ async def test_synthesizer_rejects_invalid_priority() -> None:
             ]
         }
     )
-    agent = SynthesizerAgent(_fake_client(bad, bad))  # type: ignore[arg-type]
+    agent = SynthesizerAgent(completion=_fake_completion(bad, bad))
     with pytest.raises(AgentError):
         await agent.run("input")

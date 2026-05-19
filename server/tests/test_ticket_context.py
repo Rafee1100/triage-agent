@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -29,28 +30,37 @@ def _pr(*, linked: list[dict] | None = None) -> PRContext:
     )
 
 
-def _fake_client(*responses: Any) -> SimpleNamespace:
+def _fake_completion(*responses: Any) -> Any:
     iterator = iter(responses)
 
-    async def create(**_kwargs: Any) -> Any:
+    async def completion(**_kwargs: Any) -> Any:
         return next(iterator)
 
-    return SimpleNamespace(messages=SimpleNamespace(create=create))
+    return completion
 
 
 def _tool_response(payload: dict[str, Any]) -> SimpleNamespace:
     return SimpleNamespace(
-        content=[
+        choices=[
             SimpleNamespace(
-                type="tool_use", name="ticket_context_output", input=payload
+                message=SimpleNamespace(
+                    tool_calls=[
+                        SimpleNamespace(
+                            function=SimpleNamespace(
+                                name="ticket_context_output",
+                                arguments=json.dumps(payload),
+                            )
+                        )
+                    ]
+                )
             )
         ],
-        usage=SimpleNamespace(input_tokens=200, output_tokens=60),
+        usage=SimpleNamespace(prompt_tokens=200, completion_tokens=60),
     )
 
 
 async def test_analyze_returns_defaults_when_no_linked_issue() -> None:
-    agent = TicketContextAgent(_fake_client())  # type: ignore[arg-type]
+    agent = TicketContextAgent(completion=_fake_completion())
     result = await agent.analyze(_pr(), stated_priority="high")
     assert result.stated_priority == "unknown"
     assert result.true_urgency_score == 0.5
@@ -79,7 +89,7 @@ async def test_analyze_calls_llm_when_linked_issue_present() -> None:
             }
         ]
     )
-    agent = TicketContextAgent(_fake_client(response))  # type: ignore[arg-type]
+    agent = TicketContextAgent(completion=_fake_completion(response))
     result = await agent.analyze(pr, stated_priority="low")
     assert result.label_disagreement is True
     assert "Q3" in (result.disagreement_reason or "")
@@ -95,12 +105,8 @@ async def test_disagreement_without_reason_is_rejected() -> None:
             "keywords_extracted": [],
         }
     )
-    pr = _pr(
-        linked=[
-            {"number": 1, "title": "x", "body": "y", "labels": {"nodes": []}}
-        ]
-    )
-    agent = TicketContextAgent(_fake_client(bad, bad))  # type: ignore[arg-type]
+    pr = _pr(linked=[{"number": 1, "title": "x", "body": "y", "labels": {"nodes": []}}])
+    agent = TicketContextAgent(completion=_fake_completion(bad, bad))
     with pytest.raises(AgentError):
         await agent.analyze(pr, stated_priority="low")
 
@@ -117,7 +123,7 @@ def test_format_message_includes_priority_and_issue() -> None:
         ]
     )
     msg = TicketContextAgent.format_message(pr, stated_priority="medium")
-    assert "Stated PR priority label: medium" in msg
+    assert "stated_priority: medium" in msg
     assert "Crash on cold start" in msg
     assert "Production traffic blocked." in msg
     assert "kind/bug" in msg

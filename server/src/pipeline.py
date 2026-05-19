@@ -1,7 +1,7 @@
 import asyncio
 import logging
+from typing import Any, Awaitable, Callable
 
-from anthropic import AsyncAnthropic
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.agents.author_profile import AuthorAssessment, AuthorProfileAgent
@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_LIMIT = 30
 
+CompletionFn = Callable[..., Awaitable[Any]]
+
 
 class PRBundle(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -37,11 +39,11 @@ class PRBundle(BaseModel):
 
 async def run_pipeline(
     *,
-    client: AsyncAnthropic,
     gh: GitHubClient,
     owner: str,
     name: str,
     limit: int = DEFAULT_LIMIT,
+    completion: CompletionFn | None = None,
 ) -> Ranking:
     prs = await gh.fetch_open_prs(owner, name, limit=limit)
     if not prs:
@@ -53,9 +55,9 @@ async def run_pipeline(
 
     pre_bundles = _build_pre_bundles(prs, files_per_pr, author_lookup, cross_refs, depths)
 
-    diff_agent = DiffAnalystAgent(client)
-    ticket_agent = TicketContextAgent(client)
-    author_agent = AuthorProfileAgent(client)
+    diff_agent = DiffAnalystAgent(completion=completion)
+    ticket_agent = TicketContextAgent(completion=completion)
+    author_agent = AuthorProfileAgent(completion=completion)
 
     per_pr_results = await asyncio.gather(
         *[
@@ -81,10 +83,10 @@ async def run_pipeline(
         )
     ]
 
-    synthesizer = SynthesizerAgent(client)
+    synthesizer = SynthesizerAgent(completion=completion)
     initial = await synthesizer.run(_build_synthesizer_input(bundles))
 
-    critic = CriticAgent(client)
+    critic = CriticAgent(completion=completion)
     critique = await critic.critique(initial)
 
     return apply_critic_adjustments(initial, critique)
@@ -154,24 +156,23 @@ async def _run_per_pr_agents(
 
 
 def _build_synthesizer_input(bundles: list[PRBundle]) -> str:
-    parts = [f"Open PRs to rank (N={len(bundles)}):", ""]
+    parts = [f"N={len(bundles)} PRs"]
     for b in bundles:
-        author_login = b.pr.author.login if b.pr.author else "(ghost)"
         parts.append(
-            f"PR #{b.pr.number} — {b.pr.title[:80]}\n"
-            f"  author: @{author_login}  trust={b.author_assessment.trust_score:.2f} "
-            f"(review={b.author_assessment.recommended_review_depth})\n"
-            f"  size: +{b.pr.additions}/-{b.pr.deletions}, {b.pr.changed_files} files  "
-            f"effort={b.diff.effort_minutes_estimate}min\n"
-            f"  blast_radius={b.diff.blast_radius_score:.2f}  risk_tags={b.diff.risk_tags}\n"
-            f"  stated_priority={b.features.ticket_priority_label or 'unknown'}  "
-            f"true_urgency={b.ticket.true_urgency_score:.2f}  "
-            f"ticket_disagreement={b.ticket.label_disagreement}\n"
-            f"  dependency_chain_depth={b.features.dependency_chain_depth}  "
-            f"mentioned_by={b.features.mentioned_by_other_open_prs}\n"
-            f"  diff_reasoning: {b.diff.reasoning}"
+            f"\nPR{b.pr.number} {b.pr.title[:60]}"
+            f"\n  +{b.pr.additions}/-{b.pr.deletions}/{b.pr.changed_files}f"
+            f" eff={b.diff.effort_minutes_estimate}m"
+            f" br={b.diff.blast_radius_score:.2f}"
+            f" risks={b.diff.risk_tags}"
+            f"\n  sp={b.features.ticket_priority_label or 'unknown'}"
+            f" tu={b.ticket.true_urgency_score:.2f}"
+            f" td={b.ticket.label_disagreement}"
+            f" depth={b.features.dependency_chain_depth}"
+            f" mby={b.features.mentioned_by_other_open_prs}"
+            f"\n  trust={b.author_assessment.trust_score:.2f}"
+            f"({b.author_assessment.recommended_review_depth})"
+            f" — {b.diff.reasoning[:80]}"
         )
-        parts.append("")
     return "\n".join(parts)
 
 

@@ -1,35 +1,32 @@
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from src.agents.base import BaseAgent
+from src.agents.base import HAIKU_MODEL, BaseAgent
 from src.github.models import PRContext
 
 __all__ = ["TicketContext", "TicketContextAgent"]
 
-LINKED_ISSUE_BODY_MAX = 2000
+LINKED_ISSUE_BODY_MAX = 500
 NEUTRAL_URGENCY = 0.5
 
 SYSTEM_PROMPT = """\
-You are ticket_context in TriagePilot. You read a PR's linked issue and decide whether the stated priority label matches the urgency described in the issue body.
+ticket_context — decide if stated PR priority matches the linked issue's urgency.
 
-For each input you receive:
+stated_priority: echo as given.
 
-1. stated_priority: echo the priority label exactly as given (e.g. "high", "medium", "low", or "unknown").
+true_urgency_score (0.0-1.0) from issue body content:
+- 0.0 = cleanup/docs
+- 0.3 = improvement/dev-tool
+- 0.6 = regression/customer issue/release blocker
+- 1.0 = outage/security/data loss
+Signals: "blocking", "production", "customer", "release blocker", "regression", "outage", "security".
 
-2. true_urgency_score (0.0-1.0): score the URGENCY YOU READ IN THE ISSUE BODY, not the label.
-   - 0.0 = no urgency signal (nice-to-have, cleanup, documentation)
-   - 0.3 = mild urgency (improvement, dev-tool fix)
-   - 0.6 = clear urgency (regression, customer issue, planned release blocker)
-   - 1.0 = severe urgency (production outage, security exposure, data loss)
-   Signals: "blocking", "production", "customer impact", "release blocker", "regression", "outage", "data loss", "security", "incident".
+label_disagreement: True iff |true_urgency - stated_score| > 0.3 where stated=0.85(high)/0.5(medium)/0.15(low)/0.5(unknown).
 
-3. label_disagreement: True iff |true_urgency_score - stated_score| > 0.3
-   where stated_score = 0.85 (high), 0.50 (medium), 0.15 (low), 0.50 (unknown).
+disagreement_reason: REQUIRED when disagreement=True. Quote a body phrase.
 
-4. disagreement_reason: REQUIRED when label_disagreement is True. Quote-grounded — cite a phrase from the issue body. Example: 'Body says "blocks Q3 release" but label is Low'.
+keywords_extracted: urgency phrases found (max 10).
 
-5. keywords_extracted: the actual urgency-signal phrases you found (max 10).
-
-Output strictly via the ticket_context_output tool."""
+Output via tool only."""
 
 
 class TicketContext(BaseModel):
@@ -52,22 +49,20 @@ class TicketContext(BaseModel):
 
 class TicketContextAgent(BaseAgent[TicketContext]):
     name = "ticket_context"
-    model = "claude-haiku-4-5-20251001"
+    model = HAIKU_MODEL
     output_schema = TicketContext
     system_prompt = SYSTEM_PROMPT
 
     @staticmethod
     def format_message(pr: PRContext, stated_priority: str | None) -> str:
-        parts = [f"Stated PR priority label: {stated_priority or 'unknown'}"]
-        for issue in pr.linked_issues:
-            parts.append(f"\nLinked issue #{issue.number}: {issue.title}")
+        parts = [f"stated_priority: {stated_priority or 'unknown'}"]
+        for issue in pr.linked_issues[:2]:
+            parts.append(f"\n#{issue.number}: {issue.title[:80]}")
             issue_labels = [lbl.name for lbl in issue.labels]
             if issue_labels:
-                parts.append(f"Issue labels: {', '.join(issue_labels)}")
+                parts.append(f"labels: {', '.join(issue_labels[:5])}")
             if issue.body:
-                parts.append(
-                    f"Issue body:\n{issue.body.strip()[:LINKED_ISSUE_BODY_MAX]}"
-                )
+                parts.append(f"body:\n{issue.body.strip()[:LINKED_ISSUE_BODY_MAX]}")
         return "\n".join(parts)
 
     async def analyze(

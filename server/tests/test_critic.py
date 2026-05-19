@@ -1,10 +1,11 @@
+import json
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from src.agents.base import AgentError
-from src.agents.critic import CriticAgent, RankingCritique
+from src.agents.critic import CriticAgent
 from src.agents.synthesizer import Ranking, RankedPR
 
 
@@ -23,32 +24,41 @@ def _ranking(n: int = 3) -> Ranking:
     )
 
 
-def _fake_client(*responses: Any) -> SimpleNamespace:
+def _fake_completion(*responses: Any) -> Any:
     iterator = iter(responses)
 
-    async def create(**_kwargs: Any) -> Any:
+    async def completion(**_kwargs: Any) -> Any:
         return next(iterator)
 
-    return SimpleNamespace(messages=SimpleNamespace(create=create))
+    return completion
 
 
 def _tool_response(payload: dict[str, Any]) -> SimpleNamespace:
     return SimpleNamespace(
-        content=[
+        choices=[
             SimpleNamespace(
-                type="tool_use", name="critic_output", input=payload
+                message=SimpleNamespace(
+                    tool_calls=[
+                        SimpleNamespace(
+                            function=SimpleNamespace(
+                                name="critic_output",
+                                arguments=json.dumps(payload),
+                            )
+                        )
+                    ]
+                )
             )
         ],
-        usage=SimpleNamespace(input_tokens=500, output_tokens=150),
+        usage=SimpleNamespace(prompt_tokens=500, completion_tokens=150),
     )
 
 
 def test_format_message_lists_ranking_in_order() -> None:
     msg = CriticAgent.format_message(_ranking())
     lines = msg.splitlines()
-    assert "(N=3)" in lines[0]
-    assert "#1: PR #100" in msg
-    assert "#3: PR #102" in msg
+    assert lines[0] == "N=3"
+    assert "#1: PR100" in msg
+    assert "#3: PR102" in msg
 
 
 async def test_critic_returns_empty_adjustments_for_sound_ranking() -> None:
@@ -58,7 +68,7 @@ async def test_critic_returns_empty_adjustments_for_sound_ranking() -> None:
             "overall_assessment": "Ranking is sound — top PRs align with blast_radius.",
         }
     )
-    agent = CriticAgent(_fake_client(response))  # type: ignore[arg-type]
+    agent = CriticAgent(completion=_fake_completion(response))
     critique = await agent.critique(_ranking())
     assert critique.adjustments == []
     assert "sound" in critique.overall_assessment.lower()
@@ -77,7 +87,7 @@ async def test_critic_returns_typed_adjustments() -> None:
             "overall_assessment": "Top-3 needs reorder.",
         }
     )
-    agent = CriticAgent(_fake_client(response))  # type: ignore[arg-type]
+    agent = CriticAgent(completion=_fake_completion(response))
     critique = await agent.critique(_ranking())
     assert len(critique.adjustments) == 1
     assert critique.adjustments[0].pr_number == 102
@@ -94,6 +104,6 @@ async def test_critic_rejects_more_than_three_adjustments() -> None:
             "overall_assessment": "x",
         }
     )
-    agent = CriticAgent(_fake_client(too_many, too_many))  # type: ignore[arg-type]
+    agent = CriticAgent(completion=_fake_completion(too_many, too_many))
     with pytest.raises(AgentError):
         await agent.critique(_ranking(4))
