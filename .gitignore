@@ -4,6 +4,10 @@
 .env.*.local
 *.pem
 
+# --- Claude Code (project-local overrides only) ---
+.claude/settings.local.json
+.claude/.credentials.json
+
 # --- Python (server/) ---
 __pycache__/
 *.py[cod]
