@@ -80,6 +80,69 @@ query PRFiles(
 }
 """
 
+OPEN_PRS_AT_SNAPSHOT = """
+query OpenPRsAtSnapshot($q: String!, $first: Int!) {
+  search(query: $q, type: ISSUE, first: $first) {
+    nodes {
+      ... on PullRequest {
+        number
+        title
+        body
+        url
+        createdAt
+        updatedAt
+        author {
+          login
+        }
+        headRefName
+        mergeable
+        additions
+        deletions
+        changedFiles
+        labels(first: 10) {
+          nodes {
+            name
+          }
+        }
+        closingIssuesReferences(first: 5) {
+          nodes {
+            number
+            title
+            body
+            labels(first: 10) {
+              nodes {
+                name
+              }
+            }
+          }
+        }
+        reviews(first: 10) {
+          nodes {
+            submittedAt
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+PR_REVIEW_TIMELINE = """
+query PRReviewTimeline($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number
+      mergedAt
+      reviews(first: 10) {
+        nodes {
+          submittedAt
+        }
+      }
+    }
+  }
+}
+"""
+
 AUTHOR_HISTORY = """
 query AuthorHistory(
   $mergedQuery: String!
