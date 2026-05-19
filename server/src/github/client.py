@@ -1,12 +1,15 @@
 import asyncio
 import logging
+import re
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 
-from src.github.models import PRContext
-from src.github.queries import OPEN_PRS_WITH_CONTEXT
+from src.github.cache import DEFAULT_TTL_S, DiskCache
+from src.github.models import AuthorProfile, FileChange, PRContext
+from src.github.queries import AUTHOR_HISTORY, OPEN_PRS_WITH_CONTEXT, PR_FILES
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +20,13 @@ MAX_SERVER_ERROR_RETRIES = 3
 BASE_BACKOFF_S = 1.0
 RATE_LIMIT_WAIT_CAP_S = 60.0
 GITHUB_MAX_PAGE_SIZE = 100
+MAX_PR_FILES = 500
+PR_FILES_PAGE = 100
+RECENT_PR_REVIEW_WINDOW = 20
+AUTHOR_HISTORY_DAYS = 90
+REVERT_WINDOW_DAYS = 7
+
+_PR_REF = re.compile(r"#(\d+)")
 
 
 class GitHubAPIError(Exception):
@@ -38,12 +48,14 @@ class GitHubClient:
         token: str,
         *,
         client: httpx.AsyncClient | None = None,
+        cache: DiskCache | None = None,
     ) -> None:
         if not token:
             raise ValueError("token must be a non-empty string")
         self._token = token
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S)
+        self._cache = cache if cache is not None else DiskCache()
 
     async def query(self, gql_query: str, variables: dict[str, Any]) -> dict[str, Any]:
         payload = {"query": gql_query, "variables": variables}
@@ -187,6 +199,155 @@ class GitHubClient:
                 break
 
         return collected[:limit]
+
+    async def fetch_pr_files(
+        self,
+        owner: str,
+        name: str,
+        pr_number: int,
+    ) -> list[FileChange]:
+        cache_key = f"pr_files__{owner}__{name}__{pr_number}"
+        cached = self._cache.get(cache_key) if self._cache else None
+        if cached is not None:
+            return [FileChange.model_validate(item) for item in cached.get("items", [])]
+
+        collected: list[FileChange] = []
+        cursor: str | None = None
+
+        while len(collected) < MAX_PR_FILES:
+            page_size = min(PR_FILES_PAGE, MAX_PR_FILES - len(collected))
+            variables: dict[str, Any] = {
+                "owner": owner,
+                "name": name,
+                "number": pr_number,
+                "first": page_size,
+                "after": cursor,
+            }
+            response = await self.query(PR_FILES, variables)
+
+            repository = (response.get("data") or {}).get("repository")
+            pull_request = (repository or {}).get("pullRequest")
+            if not pull_request:
+                raise GitHubAPIError(
+                    f"PR {owner}/{name}#{pr_number} not found or not accessible",
+                    body=str(response),
+                )
+
+            files = pull_request.get("files") or {}
+            for node in files.get("nodes") or []:
+                collected.append(FileChange.model_validate(node))
+
+            page_info = files.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                break
+
+        if self._cache:
+            self._cache.set(
+                cache_key,
+                {"items": [fc.model_dump() for fc in collected]},
+                ttl_seconds=DEFAULT_TTL_S,
+            )
+
+        return collected
+
+    async def fetch_author_history(
+        self,
+        owner: str,
+        name: str,
+        login: str,
+    ) -> AuthorProfile:
+        cache_key = f"author_history__{owner}__{name}__{login}"
+        cached = self._cache.get(cache_key) if self._cache else None
+        if cached is not None:
+            return AuthorProfile.model_validate(cached)
+
+        now = datetime.now(timezone.utc)
+        since_history = (now - timedelta(days=AUTHOR_HISTORY_DAYS)).date().isoformat()
+        since_reverts = (
+            now - timedelta(days=AUTHOR_HISTORY_DAYS + REVERT_WINDOW_DAYS)
+        ).date().isoformat()
+        repo = f"{owner}/{name}"
+
+        variables = {
+            "mergedQuery": (
+                f"repo:{repo} author:{login} is:pr is:merged merged:>={since_history}"
+            ),
+            "reviewsQuery": f"repo:{repo} author:{login} is:pr sort:updated-desc",
+            "revertsQuery": (
+                f'repo:{repo} is:pr is:merged in:title "Revert" '
+                f"merged:>={since_reverts}"
+            ),
+        }
+
+        response = await self.query(AUTHOR_HISTORY, variables)
+        data = response.get("data") or {}
+
+        merged_count, merged_lookup = self._parse_merged(data.get("merged"))
+        avg_reviews = self._parse_review_density(data.get("reviews"))
+        revert_count = self._parse_reverts(data.get("reverts"), merged_lookup)
+        revert_rate = revert_count / merged_count if merged_count > 0 else 0.0
+
+        profile = AuthorProfile(
+            login=login,
+            merged_pr_count_in_repo=merged_count,
+            revert_rate=revert_rate,
+            avg_review_comments_per_pr=avg_reviews,
+        )
+
+        if self._cache:
+            self._cache.set(cache_key, profile.model_dump(), ttl_seconds=DEFAULT_TTL_S)
+
+        return profile
+
+    @staticmethod
+    def _parse_merged(section: dict[str, Any] | None) -> tuple[int, dict[int, datetime]]:
+        section = section or {}
+        count = int(section.get("issueCount") or 0)
+        lookup: dict[int, datetime] = {}
+        for node in section.get("nodes") or []:
+            if not node or not node.get("mergedAt"):
+                continue
+            lookup[int(node["number"])] = datetime.fromisoformat(node["mergedAt"])
+        return count, lookup
+
+    @staticmethod
+    def _parse_review_density(section: dict[str, Any] | None) -> float:
+        section = section or {}
+        totals: list[int] = []
+        for node in (section.get("nodes") or [])[:RECENT_PR_REVIEW_WINDOW]:
+            if not node:
+                continue
+            comments = (node.get("comments") or {}).get("totalCount") or 0
+            reviews = (node.get("reviews") or {}).get("totalCount") or 0
+            totals.append(int(comments) + int(reviews))
+        return sum(totals) / len(totals) if totals else 0.0
+
+    @staticmethod
+    def _parse_reverts(
+        section: dict[str, Any] | None,
+        merged_lookup: dict[int, datetime],
+    ) -> int:
+        section = section or {}
+        if not merged_lookup:
+            return 0
+        reverted: set[int] = set()
+        for revert in section.get("nodes") or []:
+            if not revert or not revert.get("mergedAt"):
+                continue
+            revert_at = datetime.fromisoformat(revert["mergedAt"])
+            body = revert.get("body") or ""
+            for ref in _PR_REF.findall(body):
+                ref_num = int(ref)
+                if ref_num not in merged_lookup or ref_num in reverted:
+                    continue
+                delta_s = (revert_at - merged_lookup[ref_num]).total_seconds()
+                if 0 <= delta_s <= REVERT_WINDOW_DAYS * 86400:
+                    reverted.add(ref_num)
+                    break
+        return len(reverted)
 
     async def aclose(self) -> None:
         if self._owns_client:

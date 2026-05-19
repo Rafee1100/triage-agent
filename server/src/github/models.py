@@ -5,6 +5,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 __all__ = [
     "Author",
+    "AuthorProfile",
+    "FileChange",
     "Label",
     "LinkedIssue",
     "MergeableState",
@@ -80,3 +82,20 @@ class PRContext(BaseModel):
     @classmethod
     def _default_mergeable(cls, value: Any) -> Any:
         return value or "UNKNOWN"
+
+
+class FileChange(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    path: str
+    additions: int
+    deletions: int
+
+
+class AuthorProfile(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    login: str
+    merged_pr_count_in_repo: int
+    revert_rate: float
+    avg_review_comments_per_pr: float
