@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from src.agents.base import HAIKU_MODEL, BaseAgent
 from src.github.models import PRContext
@@ -37,6 +37,13 @@ class TicketContext(BaseModel):
     label_disagreement: bool
     disagreement_reason: str | None = None
     keywords_extracted: list[str] = Field(default_factory=list)
+
+    @field_validator("keywords_extracted", mode="before")
+    @classmethod
+    def _coerce_to_list(cls, v: object) -> object:
+        if isinstance(v, str):
+            return [v]
+        return v
 
     @model_validator(mode="after")
     def _require_reason_when_disagreeing(self) -> "TicketContext":

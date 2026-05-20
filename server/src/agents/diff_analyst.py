@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from src.agents.base import HAIKU_MODEL, BaseAgent
 from src.github.models import FileChange, PRContext
@@ -41,6 +41,13 @@ class DiffAnalysis(BaseModel):
     blast_radius_score: float = Field(ge=0.0, le=1.0)
     risk_tags: list[RiskTag] = Field(default_factory=list)
     reasoning: str
+
+    @field_validator("risk_tags", mode="before")
+    @classmethod
+    def _coerce_to_list(cls, v: object) -> object:
+        if isinstance(v, str):
+            return [v]
+        return v
 
 
 class DiffAnalystAgent(BaseAgent[DiffAnalysis]):

@@ -20,6 +20,7 @@ type PipelineStage =
 
 interface RankedQueueProps {
   repoSlug: string;
+  onComplete?: () => void;
 }
 
 const AGENT_LABELS: Record<AgentName, string> = {
@@ -39,11 +40,11 @@ interface PRProgress {
   agents_done: Set<AgentName>;
 }
 
-export function RankedQueue({ repoSlug }: RankedQueueProps) {
+export function RankedQueue({ repoSlug, onComplete }: RankedQueueProps) {
   const [stage, setStage] = useState<PipelineStage>("idle");
   const [totalPrs, setTotalPrs] = useState(0);
   const [progress, setProgress] = useState<Map<number, PRProgress>>(new Map());
-  const [finalRanking, setFinalRanking] = useState<RankedPR[]>([]);
+  const [ranking, setRanking] = useState<RankedPR[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const closeRef = useRef<(() => void) | null>(null);
 
@@ -53,11 +54,14 @@ export function RankedQueue({ repoSlug }: RankedQueueProps) {
     setStage("starting");
     setTotalPrs(0);
     setProgress(new Map());
-    setFinalRanking([]);
+    setRanking([]);
     setErrorMsg(null);
 
     const handle = streamRanking(repoSlug, (type, data) => {
-      const payload = data as Record<string, unknown>;
+      const payload =
+        data && typeof data === "object"
+          ? (data as Record<string, unknown>)
+          : ({} as Record<string, unknown>);
 
       if (type === "pipeline_started") {
         setTotalPrs((payload.total_prs as number) ?? 0);
@@ -83,25 +87,28 @@ export function RankedQueue({ repoSlug }: RankedQueueProps) {
       }
 
       if (type === "synthesizer_completed") {
+        const initial = (payload.ranking as RankedPR[]) ?? [];
+        setRanking(initial);
         setStage("critiquing");
         return;
       }
 
       if (type === "critic_completed") {
-        setStage("critiquing");
         return;
       }
 
       if (type === "pipeline_done") {
-        const ranking = (payload.final_ranking as RankedPR[]) ?? [];
-        setFinalRanking(ranking);
+        const final = (payload.final_ranking as RankedPR[]) ?? [];
+        setRanking(final);
         setStage("done");
+        onComplete?.();
         return;
       }
 
-      if (type === "error") {
+      if (type === "pipeline_failed") {
         setErrorMsg((payload.error as string) ?? "unknown error");
         setStage("error");
+        onComplete?.();
       }
     });
 
@@ -132,12 +139,33 @@ export function RankedQueue({ repoSlug }: RankedQueueProps) {
     );
   }
 
-  if (stage === "done") {
+  if (ranking.length > 0) {
+    const isRefining = stage === "critiquing";
     return (
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-        {finalRanking.map((pr) => (
-          <PRCard key={pr.pr_number} pr={pr} repoSlug={repoSlug} />
-        ))}
+      <div className="flex flex-col gap-4">
+        {isRefining && (
+          <div className="sticky top-3 z-20 -mx-1 px-1">
+            <Card className="border-emerald-200 bg-white/95 p-3 text-xs text-zinc-700 shadow-sm backdrop-blur dark:border-emerald-900/40 dark:bg-zinc-950/95 dark:text-zinc-300">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <span className="relative flex size-2">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                    <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
+                  </span>
+                  Critic refining ranking — positions may shift.
+                </div>
+                <div className="hidden h-1 w-32 overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800 sm:block">
+                  <div className="h-full w-full animate-[pulse_1.5s_ease-in-out_infinite] bg-emerald-500" />
+                </div>
+              </div>
+            </Card>
+          </div>
+        )}
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          {ranking.map((pr) => (
+            <PRCard key={pr.pr_number} pr={pr} repoSlug={repoSlug} />
+          ))}
+        </div>
       </div>
     );
   }
@@ -155,31 +183,33 @@ export function RankedQueue({ repoSlug }: RankedQueueProps) {
 
   return (
     <div className="flex flex-col gap-6">
-      <Card className="border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <p className="text-xs font-medium uppercase tracking-wider text-zinc-500 dark:text-zinc-500">
-              {stage === "starting" && "Loading PRs"}
-              {stage === "agents" && "Analyzing PRs"}
-              {stage === "synthesizing" && "Synthesizing ranking"}
-              {stage === "critiquing" && "Critic reviewing"}
-            </p>
-            <p className="mt-1 font-mono text-sm text-zinc-700 dark:text-zinc-300">
-              {agentsCompleted}/{totalExpectedAgents || "?"} agent calls
-              complete
-            </p>
+      <div className="sticky top-3 z-20">
+        <Card className="border-zinc-200 bg-white/95 p-4 shadow-sm backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/95">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wider text-zinc-500 dark:text-zinc-500">
+                {stage === "starting" && "Loading PRs"}
+                {stage === "agents" && "Analyzing PRs"}
+                {stage === "synthesizing" && "Synthesizing ranking"}
+                {stage === "critiquing" && "Critic reviewing"}
+              </p>
+              <p className="mt-1 font-mono text-sm text-zinc-700 dark:text-zinc-300">
+                {agentsCompleted}/{totalExpectedAgents || "?"} agent calls
+                complete
+              </p>
+            </div>
+            <span className="font-mono text-2xl font-semibold tabular-nums text-zinc-950 dark:text-zinc-50">
+              {completionPct}%
+            </span>
           </div>
-          <span className="font-mono text-2xl font-semibold tabular-nums text-zinc-950 dark:text-zinc-50">
-            {completionPct}%
-          </span>
-        </div>
-        <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800">
-          <div
-            className="h-full bg-emerald-500 transition-all duration-300"
-            style={{ width: `${completionPct}%` }}
-          />
-        </div>
-      </Card>
+          <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800">
+            <div
+              className="h-full bg-emerald-500 transition-all duration-500 ease-out"
+              style={{ width: `${completionPct}%` }}
+            />
+          </div>
+        </Card>
+      </div>
 
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
         {progressArray.length > 0

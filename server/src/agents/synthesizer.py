@@ -22,7 +22,8 @@ ai_priority: "high" if score>0.65; "medium" if 0.35-0.65; "low" if <0.35.
 label_disagreement: True iff ai_priority differs from stated_priority by >1 level (high vs low; high vs medium; medium vs low). stated="unknown" => False.
 reasoning: 1-2 sentences citing >=1 signal value.
 
-Output exactly N PRs with contiguous ranks 1..N via tool only."""
+Output exactly N PRs with contiguous ranks 1..N via tool only.
+Each output item's pr_number is the integer from the input's `pr_number=<int>` field (never a string)."""
 
 
 class RankedPR(BaseModel):
@@ -33,6 +34,10 @@ class RankedPR(BaseModel):
     reasoning: str
     ai_priority: AIPriority
     label_disagreement: bool
+    title: str | None = None
+    author_login: str | None = None
+    url: str | None = None
+    ticket_priority_label: str | None = None
 
 
 class Ranking(BaseModel):
@@ -46,3 +51,4 @@ class SynthesizerAgent(BaseAgent[Ranking]):
     model = SONNET_MODEL
     output_schema = Ranking
     system_prompt = SYSTEM_PROMPT
+    max_tokens = 4096

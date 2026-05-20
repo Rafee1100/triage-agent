@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Awaitable, Callable, Generic, TypeVar
 
@@ -17,13 +18,24 @@ T = TypeVar("T", bound=BaseModel)
 
 logger = logging.getLogger(__name__)
 
-HAIKU_MODEL = os.getenv("HAIKU_MODEL", "groq/llama-3.3-70b-versatile")
-SONNET_MODEL = os.getenv("SONNET_MODEL", "groq/llama-3.3-70b-versatile")
+HAIKU_MODEL = os.getenv("HAIKU_MODEL", "cerebras/gpt-oss-120b")
+SONNET_MODEL = os.getenv("SONNET_MODEL", "cerebras/gpt-oss-120b")
 
 MAX_TOKENS = 1024
-RETRY_ATTEMPTS = 6
+RETRY_ATTEMPTS = 10
 BASE_BACKOFF_S = 2.0
-MAX_BACKOFF_S = 60.0
+MAX_BACKOFF_S = 90.0
+LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "4"))
+
+_RETRY_AFTER_RE = re.compile(r"try again in\s+(\d+(?:\.\d+)?)\s*s", re.IGNORECASE)
+_concurrency_semaphore: asyncio.Semaphore | None = None
+
+
+def _semaphore() -> asyncio.Semaphore:
+    global _concurrency_semaphore
+    if _concurrency_semaphore is None:
+        _concurrency_semaphore = asyncio.Semaphore(LLM_CONCURRENCY)
+    return _concurrency_semaphore
 
 RETRY_REMINDER = "Return ONLY valid JSON for the tool. No prose."
 
@@ -39,6 +51,7 @@ class BaseAgent(Generic[T]):
     model: str = ""
     output_schema: type[T]
     system_prompt: str = ""
+    max_tokens: int = MAX_TOKENS
 
     def __init__(self, completion: CompletionFn | None = None) -> None:
         self._completion = completion or litellm.acompletion
@@ -118,24 +131,29 @@ class BaseAgent(Generic[T]):
         attempts = 0
         while True:
             try:
-                return await self._completion(
-                    model=self.model,
-                    max_tokens=MAX_TOKENS,
-                    messages=[
-                        {"role": "system", "content": self.system_prompt},
-                        {"role": "user", "content": user_message},
-                    ],
-                    tools=[{"type": "function", "function": tool_schema}],
-                    tool_choice={
-                        "type": "function",
-                        "function": {"name": self._tool_name()},
-                    },
-                )
+                async with _semaphore():
+                    return await self._completion(
+                        model=self.model,
+                        max_tokens=self.max_tokens,
+                        messages=[
+                            {"role": "system", "content": self.system_prompt},
+                            {"role": "user", "content": user_message},
+                        ],
+                        tools=[{"type": "function", "function": tool_schema}],
+                        tool_choice={
+                            "type": "function",
+                            "function": {"name": self._tool_name()},
+                        },
+                    )
             except (litellm.RateLimitError, litellm.APIConnectionError) as exc:
                 attempts += 1
                 if attempts >= RETRY_ATTEMPTS:
                     raise
-                delay = min(BASE_BACKOFF_S * (2 ** (attempts - 1)), MAX_BACKOFF_S)
+                suggested = _parse_retry_after(str(exc))
+                if suggested is not None:
+                    delay = min(suggested + 0.5, MAX_BACKOFF_S)
+                else:
+                    delay = min(BASE_BACKOFF_S * (2 ** (attempts - 1)), MAX_BACKOFF_S)
                 logger.warning(
                     "llm_retry",
                     extra={
@@ -143,6 +161,7 @@ class BaseAgent(Generic[T]):
                         "attempt": attempts,
                         "delay_s": delay,
                         "error": type(exc).__name__,
+                        "from_hint": suggested is not None,
                     },
                 )
                 await asyncio.sleep(delay)
@@ -193,6 +212,16 @@ class BaseAgent(Generic[T]):
             return float(litellm.completion_cost(completion_response=response) or 0.0)
         except Exception:
             return 0.0
+
+
+def _parse_retry_after(message: str) -> float | None:
+    match = _RETRY_AFTER_RE.search(message)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
+    return None
 
 
 def _compact_schema(node: Any) -> Any:

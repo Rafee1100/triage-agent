@@ -47,6 +47,7 @@ server/data/cache/
 server/server/data/cache/
 server/data/*.sqlite
 server/data/*.db
+server/data/subscriptions.json
 *.log
 
 # --- Fly.io ---

@@ -41,7 +41,7 @@ export function TriageForm({ onSubmit, busy = false }: TriageFormProps) {
             setValue(e.target.value);
             if (error) setError(null);
           }}
-          placeholder="owner/repo"
+          placeholder="Repository (owner/repo)"
           autoComplete="off"
           spellCheck={false}
           disabled={busy}

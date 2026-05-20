@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -23,7 +24,7 @@ from src.github.models import AuthorProfile, FileChange, PRContext
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_LIMIT = 30
+DEFAULT_LIMIT = int(os.getenv("PIPELINE_LIMIT", "10"))
 
 CompletionFn = Callable[..., Awaitable[Any]]
 EventCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
@@ -85,14 +86,15 @@ async def rank_prs(
         pre_bundles, diff_agent, ticket_agent, author_agent, on_event
     )
 
-    meta_by_number = {b.pr.number: _pr_meta(b) for b in bundles}
+    bundle_by_number = {b.pr.number: b for b in bundles}
 
     synthesizer = SynthesizerAgent(completion=completion)
     initial = await synthesizer.run(_build_synthesizer_input(bundles))
+    initial = _enrich_ranking(initial, bundle_by_number)
     if on_event:
         await on_event(
             "synthesizer_completed",
-            {"ranking": [_enrich(r, meta_by_number) for r in initial.prs]},
+            {"ranking": [r.model_dump(mode="json") for r in initial.prs]},
         )
 
     critic = CriticAgent(completion=completion)
@@ -110,27 +112,31 @@ async def rank_prs(
     if on_event:
         await on_event(
             "pipeline_done",
-            {"final_ranking": [_enrich(r, meta_by_number) for r in final.prs]},
+            {"final_ranking": [r.model_dump(mode="json") for r in final.prs]},
         )
     return final
 
 
-def _pr_meta(bundle: "PRBundle") -> dict[str, Any]:
-    author = bundle.pr.author.login if bundle.pr.author else None
-    return {
-        "title": bundle.pr.title,
-        "author_login": author,
-        "url": bundle.pr.url,
-        "ticket_priority_label": bundle.features.ticket_priority_label,
-    }
-
-
-def _enrich(
-    ranked_pr: Any, meta_by_number: dict[int, dict[str, Any]]
-) -> dict[str, Any]:
-    payload = ranked_pr.model_dump(mode="json")
-    payload.update(meta_by_number.get(ranked_pr.pr_number, {}))
-    return payload
+def _enrich_ranking(
+    ranking: Ranking, bundle_by_number: dict[int, "PRBundle"]
+) -> Ranking:
+    enriched = []
+    for r in ranking.prs:
+        bundle = bundle_by_number.get(r.pr_number)
+        if bundle is None:
+            enriched.append(r)
+            continue
+        enriched.append(
+            r.model_copy(
+                update={
+                    "title": bundle.pr.title,
+                    "author_login": bundle.pr.author.login if bundle.pr.author else None,
+                    "url": bundle.pr.url,
+                    "ticket_priority_label": bundle.features.ticket_priority_label,
+                }
+            )
+        )
+    return Ranking(prs=enriched)
 
 
 async def _fetch_per_pr_context(
@@ -226,7 +232,7 @@ def _build_synthesizer_input(bundles: list[PRBundle]) -> str:
     parts = [f"N={len(bundles)} PRs"]
     for b in bundles:
         parts.append(
-            f"\nPR{b.pr.number} {b.pr.title[:60]}"
+            f"\npr_number={b.pr.number} title={b.pr.title[:60]!r}"
             f"\n  +{b.pr.additions}/-{b.pr.deletions}/{b.pr.changed_files}f"
             f" eff={b.diff.effort_minutes_estimate}m"
             f" br={b.diff.blast_radius_score:.2f}"

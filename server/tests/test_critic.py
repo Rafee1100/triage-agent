@@ -57,8 +57,8 @@ def test_format_message_lists_ranking_in_order() -> None:
     msg = CriticAgent.format_message(_ranking())
     lines = msg.splitlines()
     assert lines[0] == "N=3"
-    assert "#1: PR100" in msg
-    assert "#3: PR102" in msg
+    assert "rank=1 pr_number=100" in msg
+    assert "rank=3 pr_number=102" in msg
 
 
 async def test_critic_returns_empty_adjustments_for_sound_ranking() -> None:
