@@ -205,9 +205,6 @@ maintainer's actual first action. Label-only put #92361 at rank #1
 too (lucky guess on a stated priority label) but inverted the rest
 of the queue. Author-only ranked #92361 at #2, missing the top spot.
 
-![Streaming reasoning mid-pipeline](docs/screenshots/stream.png)
-![Final ranked queue with disagreement badge](docs/screenshots/disagreement.png)
-
 ### Methodology
 
 - **T0 selection.** `evenly_spaced_timestamps(n, lookback_days=60)`
@@ -304,7 +301,3 @@ uv run uvicorn src.api.main:app --reload
 cp web/.env.local.example web/.env.local
 cd web && pnpm install && pnpm dev
 ```
-
-## License
-
-MIT
