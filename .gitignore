@@ -44,15 +44,10 @@ pnpm-debug.log*
 # --- Data / caches ---
 .cache/
 server/data/cache/
-server/server/data/cache/
+server/data/*.json
 server/data/*.sqlite
 server/data/*.db
-server/data/subscriptions.json
 *.log
-
-# --- Fly.io ---
-.fly/
-fly.toml.local
 
 # --- macOS / IDE ---
 .DS_Store

@@ -12,11 +12,13 @@ SYSTEM_PROMPT = """\
 synthesizer — rank N open PRs by review urgency, 1=highest.
 
 Score per PR:
-  0.40 * blast_radius_score
+  0.30 * blast_radius_score
 + 0.25 * true_urgency_score
++ 0.20 * trust_score
 + 0.20 * (depth / max_depth_in_batch, else 0)
-+ 0.10 * (1 - trust_score)
 + 0.05 * (1 - effort_min/180)
+
+Reasoning: maintainers review PRs from trusted contributors first (their code lands faster), so trust_score is a positive signal here, not a "scrutiny needed" inverse.
 
 ai_priority: "high" if score>0.65; "medium" if 0.35-0.65; "low" if <0.35.
 label_disagreement: True iff ai_priority differs from stated_priority by >1 level (high vs low; high vs medium; medium vs low). stated="unknown" => False.
