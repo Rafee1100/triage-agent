@@ -44,6 +44,7 @@ pnpm-debug.log*
 # --- Data / caches ---
 .cache/
 server/data/cache/
+server/server/data/cache/
 server/data/*.sqlite
 server/data/*.db
 *.log

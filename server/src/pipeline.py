@@ -85,12 +85,14 @@ async def rank_prs(
         pre_bundles, diff_agent, ticket_agent, author_agent, on_event
     )
 
+    meta_by_number = {b.pr.number: _pr_meta(b) for b in bundles}
+
     synthesizer = SynthesizerAgent(completion=completion)
     initial = await synthesizer.run(_build_synthesizer_input(bundles))
     if on_event:
         await on_event(
             "synthesizer_completed",
-            {"ranking": [r.model_dump(mode="json") for r in initial.prs]},
+            {"ranking": [_enrich(r, meta_by_number) for r in initial.prs]},
         )
 
     critic = CriticAgent(completion=completion)
@@ -108,9 +110,27 @@ async def rank_prs(
     if on_event:
         await on_event(
             "pipeline_done",
-            {"final_ranking": [r.model_dump(mode="json") for r in final.prs]},
+            {"final_ranking": [_enrich(r, meta_by_number) for r in final.prs]},
         )
     return final
+
+
+def _pr_meta(bundle: "PRBundle") -> dict[str, Any]:
+    author = bundle.pr.author.login if bundle.pr.author else None
+    return {
+        "title": bundle.pr.title,
+        "author_login": author,
+        "url": bundle.pr.url,
+        "ticket_priority_label": bundle.features.ticket_priority_label,
+    }
+
+
+def _enrich(
+    ranked_pr: Any, meta_by_number: dict[int, dict[str, Any]]
+) -> dict[str, Any]:
+    payload = ranked_pr.model_dump(mode="json")
+    payload.update(meta_by_number.get(ranked_pr.pr_number, {}))
+    return payload
 
 
 async def _fetch_per_pr_context(

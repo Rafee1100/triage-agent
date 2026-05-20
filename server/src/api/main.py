@@ -66,13 +66,17 @@ async def get_ranking(owner: str, repo: str, request: Request) -> dict[str, Any]
         return payload
 
     ranking = await rank_prs(gh=gh, owner=owner, name=repo, prs=prs)
-    payload = {
-        "total_prs": len(prs),
-        "ranking": [
-            r.model_dump(mode="json")
-            for r in sorted(ranking.prs, key=lambda x: x.rank)
-        ],
-    }
+    pr_by_number = {pr.number: pr for pr in prs}
+    enriched_ranking = []
+    for r in sorted(ranking.prs, key=lambda x: x.rank):
+        item = r.model_dump(mode="json")
+        pr = pr_by_number.get(r.pr_number)
+        if pr:
+            item["title"] = pr.title
+            item["author_login"] = pr.author.login if pr.author else None
+            item["url"] = pr.url
+        enriched_ranking.append(item)
+    payload = {"total_prs": len(prs), "ranking": enriched_ranking}
     cache.set(key, payload)
     return payload
 
