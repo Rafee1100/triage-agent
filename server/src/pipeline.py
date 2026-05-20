@@ -4,7 +4,10 @@ from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.agents.author_profile import AuthorAssessment, AuthorProfileAgent
+from src.agents.author_profile import (
+    AuthorAssessment,
+    AuthorProfileAgent,
+)
 from src.agents.critic import CriticAgent, RankingCritique
 from src.agents.diff_analyst import DiffAnalysis, DiffAnalystAgent
 from src.agents.synthesizer import Ranking, SynthesizerAgent
@@ -23,6 +26,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_LIMIT = 30
 
 CompletionFn = Callable[..., Awaitable[Any]]
+EventCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
 class PRBundle(BaseModel):
@@ -44,52 +48,69 @@ async def run_pipeline(
     name: str,
     limit: int = DEFAULT_LIMIT,
     completion: CompletionFn | None = None,
+    on_event: EventCallback | None = None,
 ) -> Ranking:
     prs = await gh.fetch_open_prs(owner, name, limit=limit)
+    return await rank_prs(
+        gh=gh, owner=owner, name=name, prs=prs,
+        completion=completion, on_event=on_event,
+    )
+
+
+async def rank_prs(
+    *,
+    gh: GitHubClient,
+    owner: str,
+    name: str,
+    prs: list[PRContext],
+    completion: CompletionFn | None = None,
+    on_event: EventCallback | None = None,
+) -> Ranking:
     if not prs:
         return Ranking(prs=[])
+
+    if on_event:
+        await on_event("pipeline_started", {"total_prs": len(prs)})
 
     files_per_pr, author_lookup = await _fetch_per_pr_context(gh, owner, name, prs)
     cross_refs = detect_cross_pr_references(prs)
     depths = compute_dependency_depths(cross_refs)
-
     pre_bundles = _build_pre_bundles(prs, files_per_pr, author_lookup, cross_refs, depths)
 
     diff_agent = DiffAnalystAgent(completion=completion)
     ticket_agent = TicketContextAgent(completion=completion)
     author_agent = AuthorProfileAgent(completion=completion)
 
-    per_pr_results = await asyncio.gather(
-        *[
-            _run_per_pr_agents(
-                diff_agent, ticket_agent, author_agent, pr, files, author, features
-            )
-            for pr, files, author, features in pre_bundles
-        ]
+    bundles = await _run_per_pr_emitting(
+        pre_bundles, diff_agent, ticket_agent, author_agent, on_event
     )
-
-    bundles: list[PRBundle] = [
-        PRBundle(
-            pr=pr,
-            files=files,
-            author=author,
-            features=features,
-            diff=diff_a,
-            ticket=ticket_c,
-            author_assessment=author_a,
-        )
-        for (pr, files, author, features), (diff_a, ticket_c, author_a) in zip(
-            pre_bundles, per_pr_results
-        )
-    ]
 
     synthesizer = SynthesizerAgent(completion=completion)
     initial = await synthesizer.run(_build_synthesizer_input(bundles))
+    if on_event:
+        await on_event(
+            "synthesizer_completed",
+            {"ranking": [r.model_dump(mode="json") for r in initial.prs]},
+        )
 
     critic = CriticAgent(completion=completion)
     critique = await critic.critique(initial)
+    if on_event:
+        await on_event(
+            "critic_completed",
+            {
+                "adjustments": [a.model_dump(mode="json") for a in critique.adjustments],
+                "overall_assessment": critique.overall_assessment,
+            },
+        )
 
-    return apply_critic_adjustments(initial, critique)
+    final = apply_critic_adjustments(initial, critique)
+    if on_event:
+        await on_event(
+            "pipeline_done",
+            {"final_ranking": [r.model_dump(mode="json") for r in final.prs]},
+        )
+    return final
 
 
 async def _fetch_per_pr_context(
@@ -129,9 +150,7 @@ def _build_pre_bundles(
             avg_review_comments_per_pr=0.0,
         )
         features = extract(
-            pr,
-            author,
-            files,
+            pr, author, files,
             cross_pr_references=cross_refs,
             cross_pr_depths=depths,
         )
@@ -139,20 +158,48 @@ def _build_pre_bundles(
     return result
 
 
-async def _run_per_pr_agents(
+async def _run_per_pr_emitting(
+    pre_bundles: list[tuple[PRContext, list[FileChange], AuthorProfile, PRFeatures]],
     diff_agent: DiffAnalystAgent,
     ticket_agent: TicketContextAgent,
     author_agent: AuthorProfileAgent,
-    pr: PRContext,
-    files: list[FileChange],
-    author: AuthorProfile,
-    features: PRFeatures,
-) -> tuple[DiffAnalysis, TicketContext, AuthorAssessment]:
-    return await asyncio.gather(
-        diff_agent.analyze(pr, files),
-        ticket_agent.analyze(pr, features.ticket_priority_label),
-        author_agent.analyze(author),
-    )
+    on_event: EventCallback | None,
+) -> list[PRBundle]:
+    async def run_one(
+        pr: PRContext,
+        files: list[FileChange],
+        author: AuthorProfile,
+        features: PRFeatures,
+    ) -> PRBundle:
+        async def wrap(agent_name: str, coro: Awaitable[Any]) -> Any:
+            result = await coro
+            if on_event:
+                await on_event(
+                    "agent_completed",
+                    {
+                        "agent": agent_name,
+                        "pr_number": pr.number,
+                        "result": result.model_dump(mode="json"),
+                    },
+                )
+            return result
+
+        diff, ticket, author_a = await asyncio.gather(
+            wrap("diff_analyst", diff_agent.analyze(pr, files)),
+            wrap("ticket_context", ticket_agent.analyze(pr, features.ticket_priority_label)),
+            wrap("author_profile", author_agent.analyze(author)),
+        )
+        return PRBundle(
+            pr=pr,
+            files=files,
+            author=author,
+            features=features,
+            diff=diff,
+            ticket=ticket,
+            author_assessment=author_a,
+        )
+
+    return await asyncio.gather(*[run_one(*pb) for pb in pre_bundles])
 
 
 def _build_synthesizer_input(bundles: list[PRBundle]) -> str:

@@ -1,17 +1,42 @@
+import asyncio
+import json
+import logging
 import os
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from sse_starlette.sse import EventSourceResponse
 
-app = FastAPI(title="TriagePilot API", version="0.1.0")
+from src.github import GitHubClient
+from src.pipeline import DEFAULT_LIMIT, rank_prs
 
-allowed_origin = os.getenv("ALLOWED_ORIGIN", "http://localhost:3000")
+logger = logging.getLogger(__name__)
+
+ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "http://localhost:3000")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise RuntimeError("GITHUB_TOKEN env var is required")
+    gh = GitHubClient(token)
+    app.state.gh = gh
+    try:
+        yield
+    finally:
+        await gh.aclose()
+
+
+app = FastAPI(title="TriagePilot API", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[allowed_origin],
+    allow_origins=[ALLOWED_ORIGIN],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET"],
     allow_headers=["*"],
 )
 
@@ -19,3 +44,60 @@ app.add_middleware(
 @app.get("/health")
 async def health() -> dict[str, bool]:
     return {"ok": True}
+
+
+@app.get("/rank/{owner}/{repo}")
+async def get_ranking(owner: str, repo: str, request: Request) -> dict[str, Any]:
+    gh: GitHubClient = request.app.state.gh
+    prs = await gh.fetch_open_prs(owner, repo, limit=DEFAULT_LIMIT)
+    if not prs:
+        return {"total_prs": 0, "ranking": []}
+    ranking = await rank_prs(gh=gh, owner=owner, name=repo, prs=prs)
+    return {
+        "total_prs": len(prs),
+        "ranking": [
+            r.model_dump(mode="json")
+            for r in sorted(ranking.prs, key=lambda x: x.rank)
+        ],
+    }
+
+
+@app.get("/rank/{owner}/{repo}/stream")
+async def stream_ranking(
+    owner: str, repo: str, request: Request
+) -> EventSourceResponse:
+    gh: GitHubClient = request.app.state.gh
+    return EventSourceResponse(_pipeline_event_stream(gh, owner, repo))
+
+
+async def _pipeline_event_stream(
+    gh: GitHubClient, owner: str, repo: str
+) -> AsyncIterator[dict[str, Any]]:
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def emit(event_type: str, data: dict[str, Any]) -> None:
+        await queue.put({"event": event_type, "data": json.dumps(data)})
+
+    async def run() -> None:
+        try:
+            prs = await gh.fetch_open_prs(owner, repo, limit=DEFAULT_LIMIT)
+            if not prs:
+                await emit("pipeline_done", {"final_ranking": []})
+                return
+            await rank_prs(gh=gh, owner=owner, name=repo, prs=prs, on_event=emit)
+        except Exception as exc:
+            logger.exception("pipeline_failed")
+            await emit("error", {"error": str(exc)})
+        finally:
+            await queue.put(None)
+
+    task = asyncio.create_task(run())
+    try:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item
+    finally:
+        if not task.done():
+            task.cancel()
