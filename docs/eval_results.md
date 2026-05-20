@@ -1,7 +1,7 @@
 # TriagePilot evaluation results
 
 Retrospective replay against two real-world repos. For each historical
-snapshot we reconstruct the open PR queue at time `t0`, run all four
+snapshot I reconstruct the open PR queue at time `t0`, run all four
 rankers on it, and compare against the actual maintainer review order
 over the next 14 days (the "ground truth"). NDCG@5 and Kendall τ are
 computed against that ground truth.
