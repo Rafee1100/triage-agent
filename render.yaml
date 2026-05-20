@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: triagepilot-api
+    runtime: docker
+    rootDir: server
+    region: oregon
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: CEREBRAS_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGIN
+        sync: false
