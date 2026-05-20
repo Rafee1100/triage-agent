@@ -1,17 +1,18 @@
 # TriagePilot evaluation results
 
-Retrospective replay against two real-world repos. For each historical
-snapshot I reconstruct the open PR queue at time `t0`, run all four
-rankers on it, and compare against the actual maintainer review order
-over the next 14 days (the "ground truth"). NDCG@5 and Kendall τ are
-computed against that ground truth.
+I evaluated TriagePilot by retrospective replay against Kubernetes
+and Next.js. For each historical timestamp `t0`, I rebuild the queue
+of PRs that were open and unreviewed at that moment, run every
+ranker over the same PRs, and score each ranking against what the
+maintainers actually did over the following 14 days. NDCG@5 and
+Kendall τ are the metrics.
 
-**Sample size caveat.** This run used `--snapshots 3 --limit 5 PRs` on
-both repos to stay inside Cerebras free-tier rate limits — **6
-snapshots total.** Treat the numbers as directional, not statistically
-conclusive. The win shapes are consistent enough across snapshots to
-be load-bearing for prompt-tuning decisions, but a publication-grade
-claim would need 30+ snapshots × 15+ PRs.
+One thing up front: the run below is `--snapshots 3 --limit 5 PRs`
+on both repos, which is 6 snapshots total. That's what fit inside
+Cerebras free-tier rate limits during the build window. The numbers
+are directional, not statistically conclusive — you'll see that in
+the standard-deviation bars. A real evaluation would be 30+
+snapshots of 15+ PRs. That's on the next-iteration list.
 
 ## Headline results
 
@@ -26,22 +27,26 @@ claim would need 30+ snapshots × 15+ PRs.
 
 ![TriagePilot vs Label-only per-snapshot](charts/triagepilot_vs_label.png)
 
-## What this says
+## What this tells me
 
-1. **Author trust is the dominant signal.** Author-only — which just
-   ranks PRs by the author's repo-merged-PR-count and revert rate,
-   ignoring everything about the diff — is the strongest baseline on
-   both repos. Trusted contributors get reviewed first; this matches
-   how maintainer queues actually work.
-2. **TriagePilot is competitive after the prompt fix.** On Next.js it
-   beats every baseline on NDCG@5 (0.904 vs author-only 0.921 on
-   per-snapshot basis flips: see snapshots 2026-04-05 and 2026-05-05
-   below where TP wins outright). On K8s it lands roughly tied with
-   label-only and slightly behind author-only.
-3. **NDCG@5 saturates at small N.** With only 5 PRs per snapshot,
-   NDCG@5 mostly measures "is the right set in the top 5," which is
-   trivially yes when |top-5| = |snapshot|. Kendall τ is the more
-   informative metric at this scale.
+The strongest baseline is Author-only, which just sorts by the
+author's merged-PR count and revert rate, ignoring the diff
+entirely. It wins on both repos. That's not a failure of
+TriagePilot — it's an interesting fact about how maintainer
+queues actually work. Trusted contributors get reviewed first.
+The polarity fix in the synthesizer was specifically about
+catching up to this reality.
+
+TriagePilot is competitive once the prompt fix is in. On Next.js
+it's neck-and-neck with author-only on NDCG@5 and wins outright
+on two of the three snapshots. On Kubernetes it lands roughly tied
+with label-only and slightly behind author-only.
+
+NDCG@5 isn't doing much work at this snapshot size. With only 5
+PRs per snapshot, the metric mostly asks "is the right set in the
+top 5?", and the answer is trivially yes because the top-5 *is*
+the snapshot. Kendall τ is the metric to look at — it cares about
+order, not membership.
 
 ## Per-snapshot detail
 
@@ -164,26 +169,29 @@ The eval framework doesn't auto-fetch PR comment threads, so the
 task spec aren't embedded here — that capture is a manual follow-up
 once you decide which one tells the best story.
 
-## Failure mode found and fixed
+## The bug the eval caught
 
-The first eval run (`v1`, kept in `server/data/*_snapshots_v1.json`
-for reproducibility) showed TriagePilot **losing to every baseline**
-with a strongly negative Kendall τ (−0.500 on K8s, −0.133 on Next.js).
-Per-snapshot inspection showed TP's ranking was nearly the reverse of
-the maintainer's on K8s snapshot 2026-04-20.
+The first eval run (saved as `server/data/*_snapshots_v1.json`)
+had TriagePilot losing to every baseline. Kendall τ was −0.500
+on Kubernetes, −0.133 on Next.js. Looking at the per-snapshot
+detail, TriagePilot's ranking was nearly the reverse of the
+maintainer's on the 2026-04-20 Kubernetes snapshot. That's not
+noise. That's a bug.
 
-The synthesizer system prompt was telling the LLM:
+The bug was in the synthesizer system prompt. I'd written:
 
 ```
 + 0.10 * (1 - trust_score)
 ```
 
-…on the theory that an unfamiliar contributor's PR needs more scrutiny.
-Author-only's strength in the data flipped this on its head: maintainers
-actually triage trusted contributors *first* (their code lands faster),
-so trust_score should be a *positive* signal, not an inverse-scrutiny one.
+on the theory that an unfamiliar contributor's PR needs more
+scrutiny, and therefore higher priority. The data said no.
+Author-only was the strongest baseline in both repos, which meant
+maintainers actually triage trusted contributors *first* — their
+code lands faster. Trust should be a positive signal, not an
+inverse one.
 
-**Fix applied** to `server/src/agents/synthesizer.py`:
+The fix in `server/src/agents/synthesizer.py`:
 
 ```diff
 - Score per PR:
@@ -200,11 +208,12 @@ so trust_score should be a *positive* signal, not an inverse-scrutiny one.
 + + 0.05 * (1 - effort_min/180)
 ```
 
-Two changes: polarity flip on the trust term and weight bump from
-0.10 → 0.20 to match the strength of the author signal in the data.
-Blast-radius rebalanced from 0.40 → 0.30 to keep the sum at 1.0.
+Two changes: polarity flip on the trust term, and weight bumped
+from 0.10 to 0.20 to match the strength of the author signal in
+the data. Blast-radius came down from 0.40 to 0.30 to keep the
+weights at 1.0.
 
-### Before / after comparison
+### Before and after
 
 | Repo | Metric | v1 (old prompt) | v2 (current) | Δ |
 |---|---|---|---|---|
@@ -213,25 +222,34 @@ Blast-radius rebalanced from 0.40 → 0.30 to keep the sum at 1.0.
 | Next.js | NDCG@5 | 0.828 | **0.904** | +0.076 |
 | Next.js | Kendall τ | −0.133 | **+0.133** | +0.266 |
 
-Same snapshots, same PRs, only the synthesizer prompt changed. Every
-metric improved; Kendall τ flipped from anti-correlated to positively
-correlated with the maintainer's actual review order on both repos.
+Same snapshots, same PRs, only the synthesizer system prompt
+changed. Every metric improved. Kendall τ flipped from
+anti-correlated to positively correlated on both repos.
 
-## Limitations
+## What this doesn't prove yet
 
-- N=6 snapshots × 5 PRs is far too small for strong statistical
-  conclusions. The std bars overlap. Larger eval needs paid LLM tier
-  or a different free provider.
-- NDCG@5 with batches of 5 PRs is near-saturated; Kendall τ is
-  load-bearing here.
-- Cerebras `gpt-oss-120b`'s tool-calling is mostly reliable but had
-  one schema-violation failure during the v1 run (synthesizer emitted
-  `score` instead of `rank`, dropped from results).
-- All four rankers were evaluated against the same
-  `actual_review_order` ground truth, which is itself a proxy
-  (first-comment-by-maintainer timing within a 14-day window).
-- Eval was rate-limit-throttled — individual snapshots took 5–10 min
-  due to Cerebras free-tier TPM ceilings.
+6 snapshots of 5 PRs is too small for hard conclusions. The std
+bars overlap. To get past directional and into defensible, I'd
+need 30 or more snapshots of 15+ PRs, which is either a paid
+Cerebras tier or a different provider.
+
+NDCG@5 at this batch size is mostly measuring set membership, not
+order. Kendall τ is the metric carrying the analysis.
+
+Cerebras `gpt-oss-120b` has reliable tool-calling but not perfect
+tool-calling. One snapshot during the v1 run was dropped because
+the synthesizer emitted `score` instead of `rank`. That's a
+real edge case the system should retry on, not drop silently.
+
+The ground truth itself is a proxy. I'm using the first
+maintainer action (review submission or merge) within a 14-day
+window. That's a reasonable stand-in for "what did the maintainer
+prioritize," but it isn't the same thing. A maintainer who pulls
+a low-priority PR off the queue first because it's a 30-second
+read still counts as "reviewed first" here.
+
+Individual snapshots took 5–10 minutes each. Cerebras free-tier
+TPM is the bottleneck.
 
 ## Reproducing
 

@@ -11,45 +11,49 @@
 
 ## Problem Definition & Target User
 
-It's 9 AM. A maintainer opens GitHub and finds 34 open pull requests
-on a repo they own. The default sort is `updated_at` — a feed of
-*recent activity*, not *review urgency*. Three PRs are labeled `P0`,
-but one of those was filed two weeks ago by a contributor who labels
-everything `P0`. A fourth PR is labeled `chore` but touches the auth
-middleware. Somewhere in that queue is the one PR that will collide
-with next week's release branch if it isn't reviewed today. The
-maintainer has 45 minutes before the standup.
+It's 9 AM. I open GitHub and find 34 open pull requests on a repo
+I own. The default sort is `updated_at`, which is recent activity,
+not urgency. Three PRs are labeled `P0`, but one of those is two
+weeks old, filed by someone who labels everything `P0`. A fourth
+is labeled `chore` and touches the auth middleware. One of these
+PRs is going to collide with next week's release branch if I don't
+review it today. I have 45 minutes before standup.
 
-TriagePilot is built for that person: an experienced engineer or
-open-source maintainer who already knows *how* to review code, but
-whose scarcest resource is deciding *which PR to open first*. Not
-new contributors looking for tooling to ship their own PRs. Not
-engineering managers wanting throughput dashboards. The user is the
-human who has to read the code and click Approve — and who pays the
-cost personally when the queue is mis-ordered, because they're the
-one who has to rebase the conflict, write the apology comment, or
-explain in the post-mortem why the regression slipped through. They
-need a ranked queue and a one-line reason for each item, by the
-time they open their laptop.
+The user this is built for is the person on the other end of that
+queue. Someone who already knows how to review code. Their problem
+isn't reviewing — it's deciding which PR to open first when 30 of
+them have plausible reasons to be at the top. Not new contributors
+shipping their own work. Not engineering managers tracking
+throughput. The reviewer who pays for it personally when the queue
+is wrong, because they're the one rebasing the conflict and
+writing the apology comment.
+
+What they need is a ranked queue with a one-line reason for each
+item, ready by the time they sit down.
 
 ## Why This Problem Matters
 
-Mis-prioritized review queues compound silently. A blast-radius-heavy
-PR sitting at position 12 will collide with the next refactor, force
-a contentious rebase, and burn an afternoon that didn't need burning.
-Labels can't catch this because they encode the *author's* belief
-about urgency, not the *reviewer's* — and they go stale the moment
-context changes. Static heuristics (lines-changed, file-count, author
-trust alone) catch some of it but blow up on edge cases: a one-line
-diff to a Kubernetes scheduler beats a thousand-line generated
-migration every time.
+A mis-prioritized review queue costs real time, and it does it
+silently. The PR that should have been reviewed today rots for a
+week, picks up merge conflicts, and either gets force-merged
+unsafely or abandoned. Meanwhile the reviewer's morning gets spent
+on ten low-stakes PRs before they find the one that actually
+blocked the release.
 
-This is an AI problem because the right ranking depends on reading
-the diff, cross-referencing the linked ticket, weighing author trust,
-and *reconciling those signals when they disagree*. That reconciliation
-step — "the label says low, but the diff touches auth middleware" —
-is exactly what an LLM is suited for and exactly what a rules engine
-cannot do.
+Labels don't fix this. Labels are what the *author* thinks is
+urgent, not what the *reviewer* needs to look at first. They go
+stale the second context changes. Static rules like
+lines-changed or file-count aren't enough either — a one-line
+change to the Kubernetes scheduler is more dangerous than a
+thousand-line generated migration, and no rule catches that without
+reading the code.
+
+That's why it's an AI problem. The right answer needs to read the
+diff, cross-reference the linked ticket, weigh how trusted the
+author is, and reconcile those signals when they disagree. "The
+label says low priority, but the diff touches auth middleware" is
+the exact kind of judgment a rules engine can't make and an LLM
+can.
 
 ## How the Solution Works
 
@@ -90,41 +94,59 @@ cannot do.
             └──────────────────────────────────────┘
 ```
 
-A user lands on the web app, types a `owner/repo`, and hits **Triage
-now**. The server fans out three per-PR agents over the open queue,
-streams their progress to the browser via Server-Sent Events, then
-runs the synthesizer over the full batch and the critic over the
-synthesizer's output. The browser renders agent activity live and
-surfaces the final ranked queue with a one-line justification and
-a "label disagreement" badge whenever the AI's verdict and the
-stated label diverge by more than one priority level.
+The user types `owner/repo` into the web app and hits **Triage now**.
+On the backend, three small agents run in parallel for each open
+PR. Their progress streams back to the browser as Server-Sent
+Events, so you can watch the pipeline think as it goes. When all
+the per-PR work is done, the synthesizer takes the whole batch and
+ranks it; the critic gives the ranking one more look. The browser
+renders the final queue with a one-line reason per PR and flags
+every case where the AI's verdict and the GitHub label disagree by
+more than one priority level. That flag is the most useful thing
+the UI does.
 
-For recurring use, the user configures a Telegram subscription
-(bot token, chat ID, repo, time, timezone) from a modal in the web
-UI. An APScheduler job persists to `server/data/subscriptions.json`
-and fires the same pipeline at the chosen time each morning,
-posting the top 5 ranked PRs to the chat. No infrastructure changes
-are needed to add a new subscriber — it's CRUD on a JSON file.
+For people who don't want to come back to the website every
+morning, there's a Telegram subscription. Open the modal, paste a
+bot token and chat ID, pick a time and a timezone, save. An
+APScheduler job runs inside the same FastAPI process, fires the
+pipeline at the chosen time, and posts the top 5 to your chat. The
+subscriptions live in `server/data/subscriptions.json`. Adding a
+new subscriber is just a write to that file.
 
 ## AI-Native Workflow
 
-**Tools, models, agents:**
-- **LLM:** Cerebras `gpt-oss-120b` for all five agents, via LiteLLM.
-  Free-tier with reliable tool-calling and high throughput. The
-  codebase is provider-agnostic — flipping the `HAIKU_MODEL` /
-  `SONNET_MODEL` env vars switches to `anthropic/claude-haiku-4-5` /
-  `claude-sonnet-4-5` or any other LiteLLM route without code
-  changes.
-- **GitHub GraphQL API** for PR, file, issue, and author-history
-  fetches (one query, multi-resource joins).
-- **Python 3.11 + FastAPI + asyncio** for the server. SSE via
-  `sse-starlette`. Scheduling via `APScheduler.AsyncIOScheduler`.
-- **Next.js 16 + Tailwind v4 + shadcn (Base UI)** for the web
-  client. EventSource streaming on the client side.
-- **Pydantic v2** as the schema layer for tool-calling — every agent
-  returns a typed `BaseModel`, and the LLM is forced through
-  LiteLLM's tool-call interface so structured outputs are
-  schema-validated on the way back.
+The pipeline runs five agents through LiteLLM. All five point at
+Cerebras `gpt-oss-120b` by default — it's free tier, fast, and the
+only Cerebras free model whose tool-calling didn't break for me
+during the build. Switching providers is a one-line env-var change:
+set `HAIKU_MODEL` and `SONNET_MODEL` to `anthropic/claude-haiku-4-5`
+and `claude-sonnet-4-5` and the code keeps working.
+
+The backend is Python 3.11, FastAPI, and asyncio. Streaming goes
+through `sse-starlette`, and the morning briefs are scheduled with
+`APScheduler.AsyncIOScheduler` running inside the same process.
+Pydantic v2 carries the schemas — every agent returns a typed
+`BaseModel`, and the LLM is forced through LiteLLM's tool-call
+interface so the response is validated on the way back. Free-form
+text parsing isn't anywhere in the codebase.
+
+The web client is Next.js 16, Tailwind v4, and shadcn components
+built on Base UI. The browser uses native `EventSource` to consume
+the SSE stream.
+
+**Open source.** Everything is in this repo, MIT-licensed. The
+stack is open-source the whole way down: LiteLLM, FastAPI,
+sse-starlette, APScheduler, Pydantic, Next.js, Tailwind, Base UI,
+python-telegram-bot, scipy, matplotlib. No proprietary
+dependencies.
+
+**APIs.** The pipeline consumes the GitHub GraphQL API for PRs,
+files, issues, and author history; Cerebras's Cloud API via
+LiteLLM for LLM calls; and the Telegram Bot API for morning brief
+delivery. On the other side, the FastAPI server exposes
+`/rank/{owner}/{name}/stream` for the SSE pipeline events and
+`/subscriptions` for the Telegram brief CRUD. OpenAPI docs at
+`/docs` on the deployed backend.
 
 **Agent flow:**
 
@@ -159,19 +181,21 @@ are needed to add a new subscriber — it's CRUD on a JSON file.
    final Ranking (SSE → UI / Telegram)
 ```
 
-**AI tools used during development:**
-- **Claude Code** — scaffolding, agent boilerplate, GraphQL queries,
-  Pydantic schemas, eval harness, prompt iteration based on eval
-  failure modes.
-- **Cursor** — local debugging of the streaming UI and Telegram
-  integration.
+**Tools I used to build this.** Claude Code for most of the work
+— scaffolding, the agent boilerplate, the GraphQL queries, the
+Pydantic schemas, the eval harness, and the prompt iteration that
+came out of the eval failures. Cursor on the side when the
+streaming UI started misbehaving and I wanted a faster edit loop.
+A longer write-up of what each tool got right and where it failed
+is in [`BUILD_LOG.md`](BUILD_LOG.md).
 
 ## Evaluation Method & Results
 
-TriagePilot is evaluated by **retrospective replay** against two
-real-world repos. For each historical snapshot I reconstruct the
-open PR queue at time `t0`, run all four rankers on it, and compare
-against the actual maintainer review order over the next 14 days.
+I evaluated TriagePilot by **retrospective replay** against two
+real repos. For each historical snapshot I reconstruct the queue
+of open PRs at time `t0`, run all four rankers over it, and score
+each ranking against what the maintainers actually did in the
+following 14 days.
 
 | Ranker | NDCG@5 (K8s) | Kendall τ (K8s) | NDCG@5 (Next.js) | Kendall τ (Next.js) |
 |---|---|---|---|---|
@@ -182,64 +206,60 @@ against the actual maintainer review order over the next 14 days.
 
 ![NDCG@5 by ranker](docs/charts/ndcg_by_ranker.png)
 
-The most informative number is **Kendall τ on Next.js**: TriagePilot
-flipped from −0.133 (the v1 prompt, anti-correlated) to +0.133
-(positively correlated) after a single eval-driven prompt fix — a
-polarity bug in the synthesizer that was penalizing trust instead
-of rewarding it. Full per-snapshot detail and the failure-mode
-post-mortem are in [docs/eval_results.md](docs/eval_results.md).
+The number to look at is Kendall τ on Next.js. The first version of
+my synthesizer prompt got −0.133 — anti-correlated with maintainer
+behavior, which is worse than a coin flip. After a single prompt
+fix (more on that in `docs/eval_results.md`) it moved to +0.133.
+That's not a huge number in absolute terms, but the direction
+flip is the load-bearing part. The eval found a real bug and
+driving the fix from data, not vibes.
 
-### The Killer Moment
+### The killer moment
 
-On the vercel/next.js snapshot at 2026-04-05, maintainers reviewed
-in this order:
+The vercel/next.js snapshot from 2026-04-05. The maintainers ended
+up reviewing the PRs in this order:
 
 > **#92361 → #92374 → #92373 → #92369 → #92363**
 
-TriagePilot's prediction:
+TriagePilot predicted:
 
 > **#92361 → #92369 → #92374 → #92363 → #92373**
 
-TriagePilot correctly placed **PR #92361** at rank #1, matching the
-maintainer's actual first action. Label-only put #92361 at rank #1
-too (lucky guess on a stated priority label) but inverted the rest
-of the queue. Author-only ranked #92361 at #2, missing the top spot.
+The first PR is the important one. #92361 was the PR maintainers
+actually opened first, and TriagePilot put it at the top.
+Label-only got the top spot too, but only because the label
+happened to line up — it inverted the rest of the queue.
+Author-only had #92361 at rank 2 and missed the top entirely.
 
 ### Methodology
 
-- **T0 selection.** `evenly_spaced_timestamps(n, lookback_days=60)`
-  picks `n` timestamps evenly across the last 60 days (excluding
-  the endpoints).
-- **Snapshot reconstruction.** For each `t0`, GitHub search collects
-  PRs created before `t0` that were either still open or were
-  closed after `t0`. I further filter to PRs unreviewed at `t0`
-  (no `submittedAt` review timestamps before `t0`).
-- **Ground truth.** For each PR in the snapshot, the earliest
-  maintainer action (review submission OR merge) within
-  `[t0, t0 + 14 days]` is the timestamp; PRs are sorted ascending
-  by that timestamp. PRs with no action in the window sort to the
-  bottom.
-- **Metrics.** NDCG@5 with graded relevance `(n − truth_position)`;
-  Kendall τ via `scipy.stats.kendalltau` over PRs common to
-  prediction and truth. Both implementations live in
-  `server/src/eval/metrics.py`.
-- **Snapshot size gate.** Snapshots with fewer than 5 PRs after
-  filtering are skipped.
+`t0` is picked by spacing `n` timestamps evenly across the last 60
+days. For each `t0`, I pull every PR created before that moment
+that was either still open or closed afterwards, then filter to
+the ones nobody had reviewed yet. That's the snapshot.
 
-Reproduction commands are in
-[docs/eval_results.md § Reproducing](docs/eval_results.md#reproducing).
+Ground truth is what the maintainers did next. For each PR in the
+snapshot I look at the next 14 days and take the earliest
+maintainer action — review submission or merge, whichever comes
+first. Sort by that timestamp ascending. PRs with no action in
+the window sort to the bottom.
+
+NDCG@5 uses graded relevance `(n − truth_position)`. Kendall τ
+comes from `scipy.stats.kendalltau` over PRs common to both
+sequences. Both live in `server/src/eval/metrics.py`. Snapshots
+with fewer than 5 PRs after filtering are dropped.
+
+Full reproduction commands are at the bottom of
+[docs/eval_results.md](docs/eval_results.md#reproducing).
 
 ## Baseline Comparison: Why Not Just Use ChatGPT?
 
-To test whether the agent decomposition is doing work that a single
-frontier LLM call can't, I ran a head-to-head experiment on the
-Next.js 2026-04-05 snapshot (the same one used as the killer
-moment above):
-
-1. **TriagePilot:** ran the full multi-agent pipeline as deployed.
-2. **ChatGPT baseline:** pasted the same 5 PRs into ChatGPT-4.5
-   (titles, bodies, file lists, author logins) and asked
-   *"rank these by review urgency, 1=highest."*
+This is the question I expected to get asked, so I ran the
+experiment. Same 5 Next.js PRs that TriagePilot ranked on
+2026-04-05. I pasted the titles, bodies, file lists, and author
+logins into ChatGPT-4.5 and asked: *rank these by review urgency,
+1 = highest*. Then compared both rankings against what the
+maintainers actually did.
 
 | Ranker | Order | NDCG@5 | Kendall τ |
 |---|---|---|---|
@@ -247,44 +267,59 @@ moment above):
 | **TriagePilot** | 92361, 92369, 92374, 92363, 92373 | **0.959** | **+0.400** |
 | ChatGPT-4.5 (one-shot) | 92374, 92361, 92373, 92363, 92369 | 0.882 | +0.200 |
 
-ChatGPT's failure mode was telling: it ranked by *diff size +
-title keywords*, missing #92361 — a small auth-middleware change
-that read as low-effort but had the highest blast radius once
-you actually read the diff. TriagePilot's `DiffAnalyst` agent
-caught the blast radius, and the `Synthesizer` weighted it
-correctly because the `TicketContext` agent had separately flagged
-the linked issue as a regression. A single LLM call can't do that
-because it doesn't have the budget to read every file, every linked
-issue, and every author's history in one context window.
+ChatGPT ranked by what it could see in the titles and the
+high-level file lists — basically diff size and keywords. It put
+#92361 at rank 2. The reason that's wrong is that #92361 is a
+small auth-middleware change. It looks low-effort, which is what a
+one-shot scan picks up on, but it's the highest blast radius PR
+in the batch once you actually read the diff. TriagePilot's
+DiffAnalyst caught that, the TicketContext agent separately
+flagged the linked issue as a regression, and the synthesizer
+weighted both correctly.
 
-The agent decomposition is doing real work: it produces structured
-intermediate signals that the synthesizer can weight against each
-other, instead of asking the model to do everything implicitly.
+You can't fit 30 diffs plus 30 issues plus 30 author histories in
+a single ChatGPT prompt, so even the strongest one-shot model
+falls back to titles and labels — which is the baseline I'm
+already beating. The decomposition is doing the work the single
+prompt can't.
+
+> **Honesty caveat:** the numbers above come from one snapshot.
+> Treat the gap as directional, not statistically conclusive. A
+> proper head-to-head over 30+ snapshots is on the next-iteration
+> list.
 
 ## Limitations & Next Iteration Ideas
 
-- **Cold-start on new contributors.** Author trust scores assume
-  history exists. First-time contributors get scored neutrally,
-  which under-ranks their PRs even when the diff is high-impact.
-  *Next:* fall back to org-membership signal + recent contribution
-  velocity in adjacent repos.
-- **Single-reviewer assumption.** The ranking is global, not
-  per-reviewer-expertise. A `crypto/` PR and a `docs/` PR end up
-  in the same queue even when the human reviewer only owns one.
-  *Next:* CODEOWNERS-aware per-reviewer queues.
-- **Public-repo only.** No GitHub App / private-repo OAuth yet —
-  Telegram bot tokens are stored unencrypted on the server for
-  the same reason (single-tenant demo). *Next:* GitHub App
-  installation flow and per-user secret encryption.
-- **Eval is sample-limited.** 6 snapshots × 5 PRs is far too small
-  for strong statistical conclusions; standard-deviation bars
-  overlap. *Next:* paid Cerebras tier or batch eval against
-  archived snapshots, target 30+ snapshots × 15+ PRs.
-- **Synthesizer can drop schema-violating outputs.** Cerebras
-  `gpt-oss-120b`'s tool-calling occasionally emits `score` where
-  the schema expects `rank`. That snapshot drops silently from
-  results. *Next:* retry-with-correction loop instead of silent
-  drop, and / or a more constrained grammar (jsonformer-style).
+The honest list of what this doesn't do yet and what would fix it.
+
+**The eval is small.** 6 snapshots, 5 PRs each. The std bars in
+the chart overlap. Real claims would need at least 30 snapshots
+of 15 PRs, which is a paid Cerebras tier or a different
+free-tier provider away.
+
+**New contributors get under-ranked.** Author trust is a real
+signal in the data, but it assumes the contributor has history in
+the repo. First-timers get a neutral score and end up lower than
+they should. The fix is to fall back on org-membership and
+contribution velocity in adjacent repos when local history is
+empty.
+
+**The ranking is global, not per-reviewer.** A `crypto/` PR and a
+`docs/` PR sit in the same queue even if the reviewer only owns
+the docs side. CODEOWNERS-aware per-reviewer queues are the next
+obvious step.
+
+**Public repos only.** No GitHub App OAuth yet. And Telegram bot
+tokens are stored unencrypted on disk, which is the right
+trade-off for a single-tenant demo and the wrong one for anything
+else. A real version needs the OAuth flow plus per-user secret
+encryption.
+
+**The synthesizer occasionally violates its own schema.** Cerebras
+`gpt-oss-120b` sometimes emits `score` where the contract says
+`rank`. That snapshot gets dropped from the eval. A
+retry-with-correction loop, or a tighter grammar (jsonformer-style),
+would catch it.
 
 ## Quick Start
 
