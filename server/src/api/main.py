@@ -9,12 +9,14 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
+from src.api.cache import TTLCache
 from src.github import GitHubClient
 from src.pipeline import DEFAULT_LIMIT, rank_prs
 
 logger = logging.getLogger(__name__)
 
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "http://localhost:3000")
+RANK_CACHE_TTL_S = 600
 
 
 @asynccontextmanager
@@ -24,6 +26,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         raise RuntimeError("GITHUB_TOKEN env var is required")
     gh = GitHubClient(token)
     app.state.gh = gh
+    app.state.rank_cache = TTLCache(ttl_seconds=RANK_CACHE_TTL_S)
     try:
         yield
     finally:
@@ -49,17 +52,29 @@ async def health() -> dict[str, bool]:
 @app.get("/rank/{owner}/{repo}")
 async def get_ranking(owner: str, repo: str, request: Request) -> dict[str, Any]:
     gh: GitHubClient = request.app.state.gh
+    cache: TTLCache = request.app.state.rank_cache
+    key = f"{owner}/{repo}"
+
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
     prs = await gh.fetch_open_prs(owner, repo, limit=DEFAULT_LIMIT)
     if not prs:
-        return {"total_prs": 0, "ranking": []}
+        payload = {"total_prs": 0, "ranking": []}
+        cache.set(key, payload)
+        return payload
+
     ranking = await rank_prs(gh=gh, owner=owner, name=repo, prs=prs)
-    return {
+    payload = {
         "total_prs": len(prs),
         "ranking": [
             r.model_dump(mode="json")
             for r in sorted(ranking.prs, key=lambda x: x.rank)
         ],
     }
+    cache.set(key, payload)
+    return payload
 
 
 @app.get("/rank/{owner}/{repo}/stream")
