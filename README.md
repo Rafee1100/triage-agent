@@ -2,7 +2,7 @@
 
 > Your labels lie. TriagePilot tells you the truth, every morning at 9 AM.
 
-**Live demo:** https://triagepilot.vercel.app
+**Live demo:** [https://triage-pr-agent.vercel.app](https://triage-pr-agent.vercel.app)
 **Backend:** https://triagepilot-api.onrender.com
 **Loom walkthrough (5 min):** _[to be added]_
 **Eval results:** [docs/eval_results.md](docs/eval_results.md)
